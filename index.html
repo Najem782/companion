@@ -8,12 +8,16 @@
   body { font-family: system-ui, sans-serif; background:#111; color:#eee; max-width:460px; margin:0 auto; padding:20px; }
   h1 { font-size:1.3rem; }
   button, select { font-size:1rem; padding:12px 14px; margin:6px 6px 6px 0; border-radius:10px; border:0; background:#2bd9d9; color:#012; font-weight:600; }
+  select { background:#2a2a2a; color:#eee; font-weight:400; padding:8px 10px; }
   button:disabled { background:#444; color:#888; }
   button.alt { background:#333; color:#eee; }
   input[type=file] { margin:10px 0; width:100%; }
   progress { width:100%; height:16px; }
   #log { font-size:.9rem; color:#9fb; min-height:3em; white-space:pre-wrap; }
   .small { color:#999; font-size:.8rem; }
+  .box { background:#1b1b1b; border-radius:12px; padding:12px; margin:10px 0; }
+  .row { margin:6px 0; }
+  #preview { display:block; width:160px; height:160px; border-radius:50%; background:#000; margin:10px auto; object-fit:contain; }
 </style>
 </head>
 <body>
@@ -22,8 +26,29 @@
 <button id="connect">Connect</button>
 <span id="state" class="small">not connected</span>
 
-<input type="file" id="file" accept="image/gif">
+<input type="file" id="file" accept="image/gif,image/png,image/jpeg,image/webp">
 <div id="info" class="small"></div>
+
+<div class="box">
+  <label class="row"><input type="checkbox" id="opt" checked> Optimize for the round screen</label>
+  <div class="row">Fit
+    <select id="fit">
+      <option value="fill" selected>Crop to fill the circle</option>
+      <option value="fit">Fit whole picture inside</option>
+    </select>
+  </div>
+  <div class="row">Size
+    <select id="size">
+      <option value="466">466 (full, slower)</option>
+      <option value="400">400</option>
+      <option value="360" selected>360 (recommended)</option>
+      <option value="300">300</option>
+      <option value="240">240 (fastest)</option>
+    </select>
+  </div>
+  <img id="preview" alt="">
+  <div class="small">The page shrinks the GIF automatically if it ends up over 1 MB. Needs Chrome or Edge (and internet) for this step; otherwise the original file is sent.</div>
+</div>
 
 <div>
   Chunk size
@@ -43,27 +68,32 @@
   <button id="play" class="alt" disabled>Play GIF</button>
 </div>
 <div id="log"></div>
-<p class="small">Max 1 MB, up to 466×466 px. Smaller GIFs send faster.
-Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
+<p class="small">Max 1 MB, up to 466×466 px. Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
 
-<script>
+<script type="module">
 const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CTRL    = '4fafc201-1fb5-459e-8fcc-c5c9c3319102';
 const DATA    = '4fafc201-1fb5-459e-8fcc-c5c9c3319103';
-const MAX_BYTES = 1000000;
+const MAX_BYTES = 1000000;     // board limit
+const TARGET_BYTES = 900000;   // aim a bit lower
+const BASE = 466;              // screen size
+const MAX_FRAMES = 120;
 
-let device, ctrl, data, gifBytes = null, waiting = null;
+let device, ctrl, data, outBytes = null, waiting = null, busy = false, previewUrl = null;
 const $ = id => document.getElementById(id);
 const log = t => { $('log').textContent = t; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const enc = new TextEncoder(), dec = new TextDecoder();
+const even = n => Math.max(2, Math.round(n / 2) * 2);
 
-function setConnected(on) {
+function refreshButtons() {
+  const on = !!(device && device.gatt && device.gatt.connected);
   $('state').textContent = on ? 'connected' : 'not connected';
   $('face').disabled = $('play').disabled = !on;
-  $('send').disabled = !(on && gifBytes);
+  $('send').disabled = !(on && outBytes && !busy);
 }
 
+// ---------- Bluetooth connection ----------
 $('connect').onclick = async () => {
   if (!navigator.bluetooth) { log('Web Bluetooth is not supported in this browser.'); return; }
   try {
@@ -71,7 +101,7 @@ $('connect').onclick = async () => {
       filters: [{ name: 'Companion' }],
       optionalServices: [SERVICE]
     });
-    device.addEventListener('gattserverdisconnected', () => { setConnected(false); log('Disconnected.'); });
+    device.addEventListener('gattserverdisconnected', () => { refreshButtons(); log('Disconnected.'); });
     const server = await device.gatt.connect();
     const svc = await server.getPrimaryService(SERVICE);
     ctrl = await svc.getCharacteristic(CTRL);
@@ -82,28 +112,149 @@ $('connect').onclick = async () => {
       log('Board: ' + msg);
       if (waiting) { waiting(msg); waiting = null; }
     });
-    setConnected(true);
+    refreshButtons();
     log('Connected.');
   } catch (e) { log('Connect failed: ' + e.message); }
 };
 
-$('file').onchange = async e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  gifBytes = new Uint8Array(await f.arrayBuffer());
-  let msg = f.name + ' — ' + (gifBytes.length / 1024).toFixed(0) + ' KB';
-  const sig = String.fromCharCode(...gifBytes.slice(0, 3));
-  if (sig !== 'GIF') msg += '\n⚠ This does not look like a GIF file.';
-  else {
-    const w = gifBytes[6] | (gifBytes[7] << 8), h = gifBytes[8] | (gifBytes[9] << 8);
-    msg += ' — ' + w + '×' + h + ' px';
-    if (w > 466 || h > 466) msg += '\n⚠ Larger than 466×466, the board will reject it.';
+// ---------- GIF encoder library (loaded only when needed) ----------
+let gifencLib = null;
+async function loadGifenc() {
+  if (gifencLib) return gifencLib;
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/gifenc@1.0.3/dist/gifenc.esm.js',
+    'https://unpkg.com/gifenc@1.0.3/dist/gifenc.esm.js'
+  ];
+  for (const u of urls) {
+    try { gifencLib = await import(u); return gifencLib; } catch (e) { /* try next */ }
   }
-  if (gifBytes.length > MAX_BYTES) msg += '\n⚠ Over 1 MB, the board will reject it.';
-  $('info').textContent = msg;
-  $('send').disabled = !(device && device.gatt.connected);
-};
+  throw new Error('could not load the GIF encoder (no internet?)');
+}
 
+// ---------- Decode + crop to circle ----------
+function renderBase(image) {
+  const c = document.createElement('canvas');
+  c.width = c.height = BASE;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, BASE, BASE);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(BASE / 2, BASE / 2, BASE / 2, 0, Math.PI * 2);
+  ctx.clip();
+  const iw = image.displayWidth || image.width, ih = image.displayHeight || image.height;
+  const scale = $('fit').value === 'fill'
+    ? Math.max(BASE / iw, BASE / ih)
+    : BASE / Math.hypot(iw, ih);               // whole picture inside the circle
+  const dw = iw * scale, dh = ih * scale;
+  ctx.drawImage(image, (BASE - dw) / 2, (BASE - dh) / 2, dw, dh);
+  ctx.restore();
+  return c;
+}
+
+async function decodeFrames(file, bytes) {
+  const type = file.type || 'image/gif';
+  if (!(await ImageDecoder.isTypeSupported(type))) throw new Error('file type not supported');
+  const decoder = new ImageDecoder({ data: bytes, type });
+  await decoder.tracks.ready;
+  const n = decoder.tracks.selectedTrack.frameCount;
+  const step = Math.max(1, Math.ceil(n / MAX_FRAMES));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const { image } = await decoder.decode({ frameIndex: i });
+    const d = image.duration ? image.duration / 1000 : 100;   // µs -> ms
+    if (i % step === 0) {
+      const bmp = await createImageBitmap(renderBase(image));
+      out.push({ bmp, delay: d });
+    } else {
+      out[out.length - 1].delay += d;
+    }
+    image.close();
+    if (i % 5 === 0) { log('Reading frames… ' + (i + 1) + '/' + n); await sleep(0); }
+  }
+  decoder.close();
+  if (out.length === 1) out[0].delay = 100;
+  return out;
+}
+
+async function encodeGif(frames, S, lib) {
+  const { GIFEncoder, quantize, applyPalette } = lib;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const g = GIFEncoder();
+  for (let i = 0; i < frames.length; i++) {
+    ctx.drawImage(frames[i].bmp, 0, 0, S, S);
+    const { data } = ctx.getImageData(0, 0, S, S);
+    const palette = quantize(data, 256);
+    const index = applyPalette(data, palette);
+    g.writeFrame(index, S, S, { palette, delay: Math.max(20, Math.round(frames[i].delay)) });
+    if (i % 3 === 0) { log('Building GIF at ' + S + '×' + S + '… ' + (i + 1) + '/' + frames.length); await sleep(0); }
+  }
+  g.finish();
+  return g.bytes();
+}
+
+function halve(frames) {
+  const out = [];
+  for (let i = 0; i < frames.length; i += 2) {
+    const b = frames[i + 1];
+    out.push({ bmp: frames[i].bmp, delay: frames[i].delay + (b ? b.delay : 0) });
+  }
+  return out;
+}
+
+// ---------- File chosen ----------
+let currentFile = null;
+async function prepare() {
+  const file = currentFile;
+  if (!file) return;
+  busy = true; refreshButtons();
+  outBytes = null;
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let note = file.name + ' — original ' + (bytes.length / 1024).toFixed(0) + ' KB';
+
+    if (!$('opt').checked || typeof ImageDecoder === 'undefined') {
+      if ($('opt').checked) note += '\n⚠ This browser cannot resize (use Chrome/Edge). Sending the original.';
+      outBytes = bytes;
+      if (bytes.length > MAX_BYTES) note += '\n⚠ Over 1 MB, the board will reject it.';
+      $('info').textContent = note;
+      $('preview').src = URL.createObjectURL(file);
+      log('Ready to send.');
+      return;
+    }
+
+    const lib = await loadGifenc();
+    let frames = await decodeFrames(file, bytes);
+    let S = even(parseInt($('size').value, 10));
+    let result = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      result = await encodeGif(frames, S, lib);
+      if (result.length <= TARGET_BYTES) break;
+      if (S > 260) S = even(S * 0.85);
+      else if (frames.length > 2) frames = halve(frames);
+      else S = even(S * 0.8);
+    }
+    outBytes = result;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(new Blob([result], { type: 'image/gif' }));
+    $('preview').src = previewUrl;
+    note += '\nReady: ' + S + '×' + S + ' px, ' + frames.length + ' frame(s), ' + (result.length / 1024).toFixed(0) + ' KB';
+    if (result.length > MAX_BYTES) note += '\n⚠ Still over 1 MB, the board will reject it. Try a smaller size.';
+    $('info').textContent = note;
+    log('Ready to send.');
+  } catch (e) {
+    log('Resize failed: ' + e.message + '\nTurn off "Optimize" to send the original file.');
+  } finally {
+    busy = false; refreshButtons();
+  }
+}
+
+$('file').onchange = e => { currentFile = e.target.files[0] || null; prepare(); };
+$('opt').onchange = $('fit').onchange = $('size').onchange = () => prepare();
+
+// ---------- Sending ----------
 async function writeCtrl(text) { await ctrl.writeValue(enc.encode(text)); }
 function waitStatus(ms = 15000) {
   return new Promise((res, rej) => {
@@ -123,10 +274,10 @@ async function writeChunk(chunk) {
 }
 
 $('send').onclick = async () => {
-  if (!gifBytes) return;
-  $('send').disabled = true;
+  if (!outBytes) return;
+  busy = true; refreshButtons();
   try {
-    const size = gifBytes.length;
+    const size = outBytes.length;
     const step = parseInt($('chunk').value, 10);
     let w = waitStatus();
     await writeCtrl('START:' + size);
@@ -135,7 +286,7 @@ $('send').onclick = async () => {
 
     const t0 = performance.now();
     for (let i = 0; i < size; i += step) {
-      await writeChunk(gifBytes.slice(i, Math.min(i + step, size)));
+      await writeChunk(outBytes.slice(i, Math.min(i + step, size)));
       const pct = Math.min(100, Math.round((i + step) / size * 100));
       $('bar').value = pct;
       if ((i / step) % 20 === 0) log('Sending… ' + pct + '%');
@@ -147,7 +298,7 @@ $('send').onclick = async () => {
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     log(res === 'OK' ? 'Sent in ' + secs + ' s. Saving and playing…' : 'Board said: ' + res);
   } catch (e) { log('Send failed: ' + e.message); }
-  $('send').disabled = false;
+  busy = false; refreshButtons();
 };
 
 $('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
