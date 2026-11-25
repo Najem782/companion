@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Companion GIF Sender</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; max-width:460px; margin:0 auto; padding:20px; }
+  h1 { font-size:1.3rem; }
+  button, select { font-size:1rem; padding:12px 14px; margin:6px 6px 6px 0; border-radius:10px; border:0; background:#2bd9d9; color:#012; font-weight:600; }
+  button:disabled { background:#444; color:#888; }
+  button.alt { background:#333; color:#eee; }
+  input[type=file] { margin:10px 0; width:100%; }
+  progress { width:100%; height:16px; }
+  #log { font-size:.9rem; color:#9fb; min-height:3em; white-space:pre-wrap; }
+  .small { color:#999; font-size:.8rem; }
+</style>
+</head>
+<body>
+<h1>🐣 Companion GIF Sender</h1>
+
+<button id="connect">Connect</button>
+<span id="state" class="small">not connected</span>
+
+<input type="file" id="file" accept="image/gif">
+<div id="info" class="small"></div>
+
+<div>
+  Chunk size
+  <select id="chunk">
+    <option value="20">20 (safest)</option>
+    <option value="100">100</option>
+    <option value="180" selected>180</option>
+    <option value="240">240 (fastest)</option>
+  </select>
+</div>
+
+<button id="send" disabled>Send GIF</button>
+<progress id="bar" value="0" max="100"></progress>
+
+<div>
+  <button id="face" class="alt" disabled>Show face</button>
+  <button id="play" class="alt" disabled>Play GIF</button>
+</div>
+<div id="log"></div>
+<p class="small">Max 1 MB, up to 466×466 px. Smaller GIFs send faster.
+Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
+
+<script>
+const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CTRL    = '4fafc201-1fb5-459e-8fcc-c5c9c3319102';
+const DATA    = '4fafc201-1fb5-459e-8fcc-c5c9c3319103';
+const MAX_BYTES = 1000000;
+
+let device, ctrl, data, gifBytes = null, waiting = null;
+const $ = id => document.getElementById(id);
+const log = t => { $('log').textContent = t; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+function setConnected(on) {
+  $('state').textContent = on ? 'connected' : 'not connected';
+  $('face').disabled = $('play').disabled = !on;
+  $('send').disabled = !(on && gifBytes);
+}
+
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) { log('Web Bluetooth is not supported in this browser.'); return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'Companion' }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', () => { setConnected(false); log('Disconnected.'); });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    ctrl = await svc.getCharacteristic(CTRL);
+    data = await svc.getCharacteristic(DATA);
+    await ctrl.startNotifications();
+    ctrl.addEventListener('characteristicvaluechanged', e => {
+      const msg = dec.decode(e.target.value);
+      log('Board: ' + msg);
+      if (waiting) { waiting(msg); waiting = null; }
+    });
+    setConnected(true);
+    log('Connected.');
+  } catch (e) { log('Connect failed: ' + e.message); }
+};
+
+$('file').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  gifBytes = new Uint8Array(await f.arrayBuffer());
+  let msg = f.name + ' — ' + (gifBytes.length / 1024).toFixed(0) + ' KB';
+  const sig = String.fromCharCode(...gifBytes.slice(0, 3));
+  if (sig !== 'GIF') msg += '\n⚠ This does not look like a GIF file.';
+  else {
+    const w = gifBytes[6] | (gifBytes[7] << 8), h = gifBytes[8] | (gifBytes[9] << 8);
+    msg += ' — ' + w + '×' + h + ' px';
+    if (w > 466 || h > 466) msg += '\n⚠ Larger than 466×466, the board will reject it.';
+  }
+  if (gifBytes.length > MAX_BYTES) msg += '\n⚠ Over 1 MB, the board will reject it.';
+  $('info').textContent = msg;
+  $('send').disabled = !(device && device.gatt.connected);
+};
+
+async function writeCtrl(text) { await ctrl.writeValue(enc.encode(text)); }
+function waitStatus(ms = 15000) {
+  return new Promise((res, rej) => {
+    const t = setTimeout(() => { waiting = null; rej(new Error('timeout waiting for board')); }, ms);
+    waiting = m => { clearTimeout(t); res(m); };
+  });
+}
+async function writeChunk(chunk) {
+  for (let tries = 0; tries < 50; tries++) {
+    try {
+      if (data.writeValueWithoutResponse) await data.writeValueWithoutResponse(chunk);
+      else await data.writeValue(chunk);
+      return;
+    } catch (e) { await sleep(10); }
+  }
+  throw new Error('write failed');
+}
+
+$('send').onclick = async () => {
+  if (!gifBytes) return;
+  $('send').disabled = true;
+  try {
+    const size = gifBytes.length;
+    const step = parseInt($('chunk').value, 10);
+    let w = waitStatus();
+    await writeCtrl('START:' + size);
+    const r = await w;
+    if (r !== 'READY') throw new Error('board said ' + r);
+
+    const t0 = performance.now();
+    for (let i = 0; i < size; i += step) {
+      await writeChunk(gifBytes.slice(i, Math.min(i + step, size)));
+      const pct = Math.min(100, Math.round((i + step) / size * 100));
+      $('bar').value = pct;
+      if ((i / step) % 20 === 0) log('Sending… ' + pct + '%');
+    }
+    await sleep(150);
+    w = waitStatus(20000);
+    await writeCtrl('END');
+    const res = await w;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    log(res === 'OK' ? 'Sent in ' + secs + ' s. Saving and playing…' : 'Board said: ' + res);
+  } catch (e) { log('Send failed: ' + e.message); }
+  $('send').disabled = false;
+};
+
+$('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
+$('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
+</script>
+</body>
+</html>
