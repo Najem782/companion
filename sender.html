@@ -68,6 +68,11 @@
   <button id="face" class="alt" disabled>Show face</button>
   <button id="play" class="alt" disabled>Play GIF</button>
 </div>
+<div style="margin-top:12px">
+  <input id="ntitle" type="text" placeholder="Notification title" maxlength="30" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
+  <input id="ntext" type="text" placeholder="Notification text" maxlength="120" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
+  <button id="notif" class="alt" disabled>Send test notification</button>
+</div>
 <div id="log"></div>
 <p class="small">Max 1 MB, up to 466×466 px. Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
 
@@ -90,7 +95,7 @@ const even = n => Math.max(2, Math.round(n / 2) * 2);
 function refreshButtons() {
   const on = !!(device && device.gatt && device.gatt.connected);
   $('state').textContent = on ? 'connected' : 'not connected';
-  $('face').disabled = $('play').disabled = $('sync').disabled = !on;
+  $('face').disabled = $('play').disabled = $('sync').disabled = $('notif').disabled = !on;
   $('send').disabled = !(on && outBytes && !busy);
 }
 
@@ -312,6 +317,13 @@ $('send').onclick = async () => {
 $('sync').onclick = () => syncTime().catch(e => log(e.message));
 $('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
 $('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
+$('notif').onclick = () => {
+  const t = ($('ntitle').value || 'Hello').replace(/\|/g, '/');
+  const x = ($('ntext').value || 'Test notification').replace(/\|/g, '/');
+  let msg = 'NOTIF:' + t + '|' + x;
+  while (enc.encode(msg).length > 200) msg = msg.slice(0, -1);
+  writeCtrl(msg).catch(e => log(e.message));
+};
 </script>
 </body>
 </html>
