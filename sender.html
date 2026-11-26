@@ -73,6 +73,16 @@
   <input id="ntext" type="text" placeholder="Notification text" maxlength="120" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
   <button id="notif" class="alt" disabled>Send test notification</button>
 </div>
+<div style="margin-top:14px;padding:10px;border:1px solid #444;border-radius:10px">
+  <b>Camera mode</b>
+  <div class="small">Uses the front camera on this phone. Video stays on the phone, nothing is uploaded.</div>
+  <label><input type="checkbox" id="mBlink" checked> Blink with me (show the face first)</label><br>
+  <label><input type="checkbox" id="mGuard" checked> Angry when I use the phone during a timer</label><br>
+  <label class="small">Closeness limit <input type="range" id="mThr" min="15" max="60" value="30"></label>
+  <div><button id="camBtn" class="alt" disabled>Start camera mode</button></div>
+  <div id="camInfo" class="small"></div>
+  <video id="cam" playsinline muted style="width:1px;height:1px;opacity:0;position:absolute"></video>
+</div>
 <div id="log"></div>
 <p class="small">Max 1 MB, up to 466×466 px. Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
 
@@ -95,7 +105,7 @@ const even = n => Math.max(2, Math.round(n / 2) * 2);
 function refreshButtons() {
   const on = !!(device && device.gatt && device.gatt.connected);
   $('state').textContent = on ? 'connected' : 'not connected';
-  $('face').disabled = $('play').disabled = $('sync').disabled = $('notif').disabled = !on;
+  $('face').disabled = $('play').disabled = $('sync').disabled = $('notif').disabled = $('camBtn').disabled = !on;
   $('send').disabled = !(on && outBytes && !busy);
 }
 
@@ -317,6 +327,70 @@ $('send').onclick = async () => {
 $('sync').onclick = () => syncTime().catch(e => log(e.message));
 $('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
 $('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
+
+// ---------- Camera mode: blink mirror + "angry when you use the phone" ----------
+let camOn = false, camStream = null, landmarker = null, lastBlinkSent = 0, lastAngrySent = 0, eyesClosed = false, wakeLock = null;
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+async function safeCtrl(t) { if (busy) return; try { await writeCtrl(t); } catch (e) { /* busy or disconnected */ } }
+function camStop() {
+  camOn = false;
+  if (camStream) camStream.getTracks().forEach(t => t.stop());
+  camStream = null;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  $('camBtn').textContent = 'Start camera mode';
+  $('camInfo').textContent = '';
+}
+async function camStart() {
+  try {
+    $('camInfo').textContent = 'Loading face model (needs internet)...';
+    const vision = await import(MP);
+    if (!landmarker) {
+      const fs = await vision.FilesetResolver.forVisionTasks(MP + '/wasm');
+      landmarker = await vision.FaceLandmarker.createFromOptions(fs, {
+        baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate: 'GPU' },
+        runningMode: 'VIDEO', outputFaceBlendshapes: true, numFaces: 1
+      });
+    }
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 320, height: 240 }, audio: false });
+    const v = $('cam'); v.srcObject = camStream; await v.play();
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    if ($('mBlink').checked) await safeCtrl('FACE');
+    camOn = true;
+    $('camBtn').textContent = 'Stop camera mode';
+    $('camInfo').textContent = 'Running. Keep this page open and the phone facing you.';
+    camLoop();
+  } catch (e) { log('Camera mode failed: ' + e.message); camStop(); }
+}
+function camLoop() {
+  if (!camOn) return;
+  const v = $('cam');
+  if (v.readyState >= 2 && !document.hidden) {
+    const r = landmarker.detectForVideo(v, performance.now());
+    const now = performance.now();
+    if (r.faceLandmarks && r.faceLandmarks.length) {
+      const lm = r.faceLandmarks[0];
+      let minX = 1, maxX = 0;
+      for (const p of lm) { if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x; }
+      const width = (maxX - minX) * 100;                       // face width in % of the frame
+      const cats = r.faceBlendshapes && r.faceBlendshapes[0] ? r.faceBlendshapes[0].categories : [];
+      let bl = 0, br = 0;
+      for (const c of cats) { if (c.categoryName === 'eyeBlinkLeft') bl = c.score; if (c.categoryName === 'eyeBlinkRight') br = c.score; }
+      const closed = (bl + br) / 2 > 0.5;
+      if ($('mBlink').checked && closed && !eyesClosed && now - lastBlinkSent > 500) { lastBlinkSent = now; safeCtrl('BLINK'); }
+      eyesClosed = closed;
+      if ($('mGuard').checked && width > +$('mThr').value && now - lastAngrySent > 2500) { lastAngrySent = now; safeCtrl('ANGRY'); }
+      $('camInfo').textContent = 'Face width ' + width.toFixed(0) + '% (angry above ' + $('mThr').value + '%)';
+    } else {
+      $('camInfo').textContent = 'No face seen';
+    }
+  }
+  setTimeout(camLoop, 80);
+}
+document.addEventListener('visibilitychange', () => {
+  if (camOn && document.hidden && $('mGuard').checked) safeCtrl('ANGRY');   // you left this page
+});
+$('camBtn').onclick = () => (camOn ? camStop() : camStart());
+
 $('notif').onclick = () => {
   const t = ($('ntitle').value || 'Hello').replace(/\|/g, '/');
   const x = ($('ntext').value || 'Test notification').replace(/\|/g, '/');
