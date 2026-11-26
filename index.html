@@ -1,308 +1,802 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Companion GIF Sender</title>
-<style>
-  body { font-family: system-ui, sans-serif; background:#111; color:#eee; max-width:460px; margin:0 auto; padding:20px; }
-  h1 { font-size:1.3rem; }
-  button, select { font-size:1rem; padding:12px 14px; margin:6px 6px 6px 0; border-radius:10px; border:0; background:#2bd9d9; color:#012; font-weight:600; }
-  select { background:#2a2a2a; color:#eee; font-weight:400; padding:8px 10px; }
-  button:disabled { background:#444; color:#888; }
-  button.alt { background:#333; color:#eee; }
-  input[type=file] { margin:10px 0; width:100%; }
-  progress { width:100%; height:16px; }
-  #log { font-size:.9rem; color:#9fb; min-height:3em; white-space:pre-wrap; }
-  .small { color:#999; font-size:.8rem; }
-  .box { background:#1b1b1b; border-radius:12px; padding:12px; margin:10px 0; }
-  .row { margin:6px 0; }
-  #preview { display:block; width:160px; height:160px; border-radius:50%; background:#000; margin:10px auto; object-fit:contain; }
-</style>
-</head>
-<body>
-<h1>🐣 Companion GIF Sender</h1>
+// Cute companion v4: smartwatch-style interface
+//   Clock face (analog / digital)  <--swipe-->  App grid (Timer, Face, GIF)
+//
+// NAVIGATION
+//   Swipe left on the clock  -> app grid.   Swipe right on the grid -> clock.
+//   Tap the clock            -> switch analog / digital.
+//   Tap an app icon          -> open it.    Swipe right inside an app -> back to the grid.
+//   BOOT button              -> toggle clock / grid (stops the alarm, cancels a running timer).
+//
+// TIMER APP
+//   Open Timer, touch the dial and slide to the minute (top = 60, right = 15, bottom = 30,
+//   left = 45), release to start. Slide to the centre and release to cancel.
+//   A thin orange ring around the clock shows a running timer. The speaker beeps when done.
+//
+// TIME is set from the phone page over Bluetooth (it syncs automatically when you connect).
+//
+// Arduino IDE settings:
+//   Board: ESP32S3 Dev Module | USB CDC On Boot: Enabled | PSRAM: OPI PSRAM
+//   Flash Size: 8MB | Partition Scheme: "8M with spiffs (3MB APP/1.5MB SPIFFS)"
+// Libraries: "GFX Library for Arduino", "AnimatedGIF", arduino-audio-tools, arduino-audio-driver
 
-<button id="connect">Connect</button>
-<span id="state" class="small">not connected</span>
+#include <Arduino_GFX_Library.h>
+#include <AnimatedGIF.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <LittleFS.h>
+#include <Wire.h>
+#include <sys/time.h>
+#include <time.h>
+#include "AudioTools.h"
+#include "AudioBoard.h"
+using namespace audio_driver;
 
-<input type="file" id="file" accept="image/gif,image/png,image/jpeg,image/webp">
-<div id="info" class="small"></div>
+// ---------- Board pins ----------
+#define LCD_CS   10
+#define LCD_PCLK 11
+#define LCD_D0   12
+#define LCD_D1   13
+#define LCD_D2   14
+#define LCD_D3   15
+#define LCD_RST  8
+#define PWR_EN   18
+#define BOOT_BTN 0
 
-<div class="box">
-  <label class="row"><input type="checkbox" id="opt" checked> Optimize for the round screen</label>
-  <div class="row">Fit
-    <select id="fit">
-      <option value="fill" selected>Crop to fill the circle</option>
-      <option value="fit">Fit whole picture inside</option>
-    </select>
-  </div>
-  <div class="row">Size
-    <select id="size">
-      <option value="466">466 (full, slower)</option>
-      <option value="400">400</option>
-      <option value="360" selected>360 (recommended)</option>
-      <option value="300">300</option>
-      <option value="240">240 (fastest)</option>
-    </select>
-  </div>
-  <img id="preview" alt="">
-  <div class="small">The page shrinks the GIF automatically if it ends up over 1 MB. Needs Chrome or Edge (and internet) for this step; otherwise the original file is sent.</div>
-</div>
+#define PA_PIN   46          // speaker amplifier enable
+#define I2S_MCLK 38
+#define I2S_BCLK 39
+#define I2S_LRCK 41
+#define I2S_DOUT 42
+#define I2C_SDA  47
+#define I2C_SCL  48
 
-<div>
-  Chunk size
-  <select id="chunk">
-    <option value="20">20 (safest)</option>
-    <option value="100">100</option>
-    <option value="180" selected>180</option>
-    <option value="240">240 (fastest)</option>
-  </select>
-</div>
+// ---------- Touch (CST820) ----------
+#define TOUCH_ADDR     0x15
+#define TOUCH_FLIP_X   false   // set true if left/right is mirrored
+#define TOUCH_FLIP_Y   false   // set true if up/down is mirrored
+#define TOUCH_SWAP_XY  false   // set true if x and y are swapped
 
-<button id="send" disabled>Send GIF</button>
-<progress id="bar" value="0" max="100"></progress>
+// ---------- Colours (RGB565) ----------
+#define C_BLACK  0x0000
+#define C_WHITE  0xFFFF
+#define C_CYAN   0x07FF
+#define C_PINK   0xF81F
+#define C_ORANGE 0xFD20
+#define C_GRAY   0x2945
+#define C_LGRAY  0x8410
 
-<div>
-  <button id="face" class="alt" disabled>Show face</button>
-  <button id="play" class="alt" disabled>Play GIF</button>
-</div>
-<div id="log"></div>
-<p class="small">Max 1 MB, up to 466×466 px. Needs a Web Bluetooth browser: Chrome on Android/PC/Mac. On iPhone use a Web Bluetooth browser such as Bluefy.</p>
+// ---------- BLE ----------
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CTRL_UUID    "4fafc201-1fb5-459e-8fcc-c5c9c3319102"
+#define DATA_UUID    "4fafc201-1fb5-459e-8fcc-c5c9c3319103"
 
-<script type="module">
-const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
-const CTRL    = '4fafc201-1fb5-459e-8fcc-c5c9c3319102';
-const DATA    = '4fafc201-1fb5-459e-8fcc-c5c9c3319103';
-const MAX_BYTES = 1000000;     // board limit
-const TARGET_BYTES = 900000;   // aim a bit lower
-const BASE = 466;              // screen size
-const MAX_FRAMES = 120;
+// ---------- Display ----------
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(
+  LCD_CS, LCD_PCLK, LCD_D0, LCD_D1, LCD_D2, LCD_D3);
+Arduino_CO5300 *gfx = new Arduino_CO5300(
+  bus, LCD_RST, 0, 466, 466, 6, 0, 0, 0);
 
-let device, ctrl, data, outBytes = null, waiting = null, busy = false, previewUrl = null;
-const $ = id => document.getElementById(id);
-const log = t => { $('log').textContent = t; };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const enc = new TextEncoder(), dec = new TextDecoder();
-const even = n => Math.max(2, Math.round(n / 2) * 2);
+// Companion face canvas (all values EVEN)
+const int CX = 100, CY = 100, CW = 266, CH = 300;
+Arduino_Canvas *cv = new Arduino_Canvas(CW, CH, gfx, CX, CY);
+const int EX_L = 65, EX_R = 201, EY = 90, EW = 34, EH = 46;
+const int MX = 133, MY = 220;
+uint32_t nextEvent = 0;
 
-function refreshButtons() {
-  const on = !!(device && device.gatt && device.gatt.connected);
-  $('state').textContent = on ? 'connected' : 'not connected';
-  $('face').disabled = $('play').disabled = !on;
-  $('send').disabled = !(on && outBytes && !busy);
+// Full-screen canvas for clock / grid / timer screens
+Arduino_Canvas *tcv = new Arduino_Canvas(466, 466, gfx, 0, 0);
+
+// GIF canvas (created per GIF)
+Arduino_Canvas *gcv = nullptr;
+uint16_t *gfb = nullptr;
+int gW = 0, gH = 0;
+
+// ---------- GIF buffers ----------
+const size_t MAX_GIF = 1000000;
+uint8_t *rxBuf = nullptr;
+uint8_t *playBuf = nullptr;
+size_t playSize = 0;
+volatile size_t gifExpected = 0, gifReceived = 0;
+volatile bool receiving = false, newGifReady = false;
+volatile bool cmdFace = false, cmdGif = false;
+
+AnimatedGIF gif;
+enum Mode { MODE_CLOCK, MODE_GRID, MODE_FACE, MODE_GIF, MODE_SET, MODE_TIMER, MODE_ALARM };
+Mode mode = MODE_CLOCK;
+uint32_t nextFrameAt = 0;
+bool fsOK = false;
+
+BLECharacteristic *ctrlChar = nullptr;
+
+// ---------- Clock ----------
+volatile bool timeSet = false;
+bool digitalFace = false;
+long lastClockKey = -1;
+bool forceClock = true;
+const char *DAYS[]   = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+const char *MONTHS[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+
+// ---------- Timer state ----------
+bool timerActive = false;
+uint32_t timerEndMs = 0, timerTotalMs = 0;
+long lastSec = -1;
+int setMin = -99;
+uint32_t alarmStart = 0, lastFlash = 0;
+bool flashOn = false;
+
+// ---------- App grid layout ----------
+const int TILE_R = 62;
+const int TILE_X[3] = {233, 150, 316};
+const int TILE_Y[3] = {140, 305, 305};
+
+// ---------- Audio ----------
+AudioInfo ainfo(16000, 2, 16);
+SineWaveGenerator<int16_t> sine(8000);
+GeneratedSoundStream<int16_t> sound(sine);
+I2SStream i2s;
+StreamCopy copier(i2s, sound);
+DriverPins dpins;
+AudioBoard board(AudioDriverES8311, dpins);
+volatile bool beepOn = false;
+
+void audioTask(void *) {
+  for (;;) {
+    if (beepOn) copier.copy();
+    else vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
-// ---------- Bluetooth connection ----------
-$('connect').onclick = async () => {
-  if (!navigator.bluetooth) { log('Web Bluetooth is not supported in this browser.'); return; }
-  try {
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ name: 'Companion' }],
-      optionalServices: [SERVICE]
-    });
-    device.addEventListener('gattserverdisconnected', () => { refreshButtons(); log('Disconnected.'); });
-    const server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SERVICE);
-    ctrl = await svc.getCharacteristic(CTRL);
-    data = await svc.getCharacteristic(DATA);
-    await ctrl.startNotifications();
-    ctrl.addEventListener('characteristicvaluechanged', e => {
-      const msg = dec.decode(e.target.value);
-      log('Board: ' + msg);
-      if (waiting) { waiting(msg); waiting = null; }
-    });
-    refreshButtons();
-    log('Connected.');
-  } catch (e) { log('Connect failed: ' + e.message); }
+void setupAudio() {
+  pinMode(PA_PIN, OUTPUT);
+  digitalWrite(PA_PIN, LOW);
+  dpins.addI2C(PinFunction::CODEC, Wire);
+  dpins.addI2S(PinFunction::CODEC, I2S_MCLK, I2S_BCLK, I2S_LRCK, I2S_DOUT);
+  if (!board.begin()) { Serial.println("ES8311 init failed"); return; }
+  board.setVolume(60);
+  auto cfg = i2s.defaultConfig(TX_MODE);
+  cfg.copyFrom(ainfo);
+  cfg.pin_mck = I2S_MCLK;
+  cfg.pin_bck = I2S_BCLK;
+  cfg.pin_ws = I2S_LRCK;
+  cfg.pin_data = I2S_DOUT;
+  i2s.begin(cfg);
+  sine.begin(ainfo, 880);
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 2, nullptr, 0);
+}
+
+// ---------- Touch ----------
+bool readTouch(int &x, int &y) {
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write(0x01);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)TOUCH_ADDR, (uint8_t)6) != 6) return false;
+  Wire.read();                       // gesture
+  uint8_t n = Wire.read();           // number of fingers
+  uint8_t xh = Wire.read(), xl = Wire.read(), yh = Wire.read(), yl = Wire.read();
+  if (!n) return false;
+  int rx = ((xh & 0x0F) << 8) | xl;
+  int ry = ((yh & 0x0F) << 8) | yl;
+  if (TOUCH_SWAP_XY) { int t = rx; rx = ry; ry = t; }
+  if (TOUCH_FLIP_X) rx = 465 - rx;
+  if (TOUCH_FLIP_Y) ry = 465 - ry;
+  x = constrain(rx, 0, 465);
+  y = constrain(ry, 0, 465);
+  return true;
+}
+
+// ================= Drawing helpers (full-screen canvas) =================
+void centerText(const char *s, int cx, int cy, int size, uint16_t col) {
+  tcv->setTextSize(size);
+  tcv->setTextColor(col);
+  int16_t x1, y1; uint16_t w, h;
+  tcv->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  tcv->setCursor(cx - (int)w / 2 - x1, cy - (int)h / 2 - y1);
+  tcv->print(s);
+}
+
+void ringDot(float deg, int R, int r, uint16_t col) {
+  float a = deg * PI / 180.0f;
+  tcv->fillCircle((int)(233 + R * sinf(a)), (int)(233 - R * cosf(a)), r, col);
+}
+
+void drawRing(float sweepDeg, uint16_t col) {
+  for (float a = 0; a <= sweepDeg; a += 1.5f) ringDot(a, 218, 7, col);
+}
+
+void thickLine(float x0, float y0, float x1, float y1, int w, uint16_t col) {
+  float dx = x1 - x0, dy = y1 - y0;
+  float len = sqrtf(dx * dx + dy * dy);
+  int steps = (int)(len / 2) + 1;
+  for (int i = 0; i <= steps; i++) {
+    float f = (float)i / steps;
+    tcv->fillCircle((int)(x0 + dx * f), (int)(y0 + dy * f), w / 2, col);
+  }
+}
+
+void hand(float deg, float len, int w, uint16_t col, float tail) {
+  float a = deg * PI / 180.0f;
+  float s = sinf(a), c = cosf(a);
+  thickLine(233 - tail * s, 233 + tail * c, 233 + len * s, 233 - len * c, w, col);
+}
+
+// ================= Clock face =================
+void drawClock() {
+  tcv->fillScreen(C_BLACK);
+
+  // thin orange ring while a timer is running
+  if (timerActive) {
+    long rem = (long)(timerEndMs - millis());
+    if (rem < 0) rem = 0;
+    float frac = (float)rem / (float)timerTotalMs;
+    for (float a = 0; a <= 360.0f * frac; a += 2) ringDot(a, 228, 3, C_ORANGE);
+  }
+
+  if (!timeSet) {
+    centerText("--:--", 233, 200, 9, C_WHITE);
+    centerText("Open the phone page", 233, 285, 2, C_LGRAY);
+    centerText("to set the time", 233, 310, 2, C_LGRAY);
+    tcv->flush();
+    return;
+  }
+
+  time_t nowT = time(nullptr);
+  struct tm tmv;
+  gmtime_r(&nowT, &tmv);     // time was stored as local time, so gmtime = local time
+  int h = tmv.tm_hour, m = tmv.tm_min, s = tmv.tm_sec;
+  char buf[24];
+
+  if (!digitalFace) {
+    // ----- analog -----
+    for (int k = 0; k < 60; k++) {
+      if (k % 5 == 0) ringDot(k * 6, 210, 5, C_WHITE);
+      else ringDot(k * 6, 212, 2, C_LGRAY);
+    }
+    centerText("12", 233, 62, 4, C_WHITE);
+    centerText("3", 405, 233, 4, C_WHITE);
+    centerText("6", 233, 405, 4, C_WHITE);
+    centerText("9", 61, 233, 4, C_WHITE);
+    snprintf(buf, sizeof(buf), "%s %d", DAYS[tmv.tm_wday], tmv.tm_mday);
+    centerText(buf, 233, 320, 3, C_ORANGE);
+    hand((h % 12) * 30 + m * 0.5f, 100, 11, C_WHITE, 12);
+    hand(m * 6 + s * 0.1f, 160, 8, C_WHITE, 12);
+    hand(s * 6, 185, 3, C_ORANGE, 35);
+    tcv->fillCircle(233, 233, 10, C_ORANGE);
+    tcv->fillCircle(233, 233, 4, C_BLACK);
+  } else {
+    // ----- digital -----
+    for (int k = 0; k < 60; k++) ringDot(k * 6, 210, 2, C_GRAY);
+    for (float a = 0; a <= s * 6; a += 3) ringDot(a, 210, 5, C_ORANGE);
+    snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
+    centerText(buf, 233, 200, 10, C_WHITE);
+    snprintf(buf, sizeof(buf), "%s %d %s", DAYS[tmv.tm_wday], tmv.tm_mday, MONTHS[tmv.tm_mon]);
+    centerText(buf, 233, 290, 4, C_CYAN);
+  }
+  tcv->flush();
+}
+
+// ================= App grid =================
+void drawTile(int idx) {
+  int cx = TILE_X[idx], cy = TILE_Y[idx];
+  if (idx == 0) {                       // Timer
+    tcv->fillCircle(cx, cy, TILE_R, C_ORANGE);
+    tcv->fillCircle(cx, cy, 32, C_WHITE);
+    tcv->fillCircle(cx, cy, 26, C_ORANGE);
+    thickLine(cx, cy, cx, cy - 20, 5, C_WHITE);
+    thickLine(cx, cy, cx + 14, cy, 5, C_WHITE);
+    centerText("Timer", cx, cy + TILE_R + 16, 2, C_WHITE);
+  } else if (idx == 1) {                // Face
+    tcv->fillCircle(cx, cy, TILE_R, C_CYAN);
+    tcv->fillEllipse(cx - 20, cy - 8, 8, 13, C_BLACK);
+    tcv->fillEllipse(cx + 20, cy - 8, 8, 13, C_BLACK);
+    tcv->fillEllipse(cx, cy + 24, 15, 8, C_BLACK);
+    centerText("Face", cx, cy + TILE_R + 16, 2, C_WHITE);
+  } else {                              // GIF
+    tcv->fillCircle(cx, cy, TILE_R, C_PINK);
+    tcv->fillTriangle(cx - 14, cy - 24, cx - 14, cy + 24, cx + 26, cy, C_WHITE);
+    centerText("GIF", cx, cy + TILE_R + 16, 2, C_WHITE);
+  }
+}
+
+void drawGrid() {
+  tcv->fillScreen(C_BLACK);
+  for (int i = 0; i < 3; i++) drawTile(i);
+  tcv->flush();
+}
+
+int hitTile(int x, int y) {
+  for (int i = 0; i < 3; i++) {
+    int dx = x - TILE_X[i], dy = y - TILE_Y[i];
+    if (dx * dx + dy * dy < (TILE_R + 8) * (TILE_R + 8)) return i;
+  }
+  return -1;
+}
+
+// ================= Companion face =================
+void drawFace(int eyeH, int mouth) {
+  cv->fillScreen(C_BLACK);
+  if (eyeH < 5) {
+    cv->fillRect(EX_L - EW, EY - 2, EW * 2, 5, C_CYAN);
+    cv->fillRect(EX_R - EW, EY - 2, EW * 2, 5, C_CYAN);
+  } else {
+    cv->fillEllipse(EX_L, EY, EW, eyeH, C_CYAN);
+    cv->fillEllipse(EX_R, EY, EW, eyeH, C_CYAN);
+    cv->fillCircle(EX_L + 10, EY - eyeH / 3, 8, C_WHITE);
+    cv->fillCircle(EX_R + 10, EY - eyeH / 3, 8, C_WHITE);
+  }
+  if (mouth > 0) cv->fillEllipse(MX, MY, 20 + mouth / 2, mouth, C_PINK);
+  cv->flush();
+}
+
+void blinkEyes() {
+  for (int h = EH; h >= 2; h -= 8) { drawFace(h, 0); delay(8); }
+  delay(60);
+  for (int h = 2; h <= EH; h += 8) { drawFace(h, 0); delay(8); }
+  drawFace(EH, 0);
+}
+
+void yawn() {
+  for (int m = 0; m <= 50; m += 5) { drawFace(max(4, EH - m), m); delay(30); }
+  delay(900);
+  for (int m = 50; m >= 0; m -= 5) { drawFace(max(4, EH - m), m); delay(30); }
+  drawFace(EH, 0);
+}
+
+// ================= Navigation =================
+void goClock() {
+  gif.close();
+  mode = MODE_CLOCK;
+  forceClock = true;
+}
+
+void goGrid() {
+  gif.close();
+  mode = MODE_GRID;
+  drawGrid();
+}
+
+void goFace() {
+  gif.close();
+  mode = MODE_FACE;
+  gfx->fillScreen(C_BLACK);
+  drawFace(EH, 0);
+  nextEvent = millis() + 2000;
+}
+
+// ================= GIF =================
+void GIFDraw(GIFDRAW *p) {
+  if (!gfb) return;
+  int y = p->iY + p->y;
+  if (y < 0 || y >= gH) return;
+  int w = p->iWidth;
+  if (p->iX + w > gW) w = gW - p->iX;
+  if (w <= 0) return;
+  uint8_t *s = p->pPixels;
+  uint16_t *pal = p->pPalette;
+  uint16_t *d = gfb + (size_t)y * gW + p->iX;
+  bool hasT = p->ucHasTransparency;
+  if (p->ucDisposalMethod == 2) {
+    for (int x = 0; x < w; x++)
+      if (s[x] == p->ucTransparent) s[x] = p->ucBackground;
+    hasT = false;
+  }
+  if (hasT) {
+    uint8_t t = p->ucTransparent;
+    for (int x = 0; x < w; x++)
+      if (s[x] != t) d[x] = pal[s[x]];
+  } else {
+    for (int x = 0; x < w; x++) d[x] = pal[s[x]];
+  }
+}
+
+bool startGif() {
+  if (!playBuf || playSize == 0) return false;
+  gif.close();
+  if (!gif.open(playBuf, (int)playSize, GIFDraw)) return false;
+  int w = gif.getCanvasWidth(), h = gif.getCanvasHeight();
+  if (w <= 0 || h <= 0 || w > 466 || h > 466) { gif.close(); return false; }
+  int ew = (w + 1) & ~1, eh = (h + 1) & ~1;
+  int ox = ((466 - ew) / 2) & ~1, oy = ((466 - eh) / 2) & ~1;
+  if (gcv) { delete gcv; gcv = nullptr; gfb = nullptr; }
+  gcv = new Arduino_Canvas(ew, eh, gfx, ox, oy);
+  if (!gcv->begin(GFX_SKIP_OUTPUT_BEGIN)) {
+    delete gcv; gcv = nullptr; gif.close(); return false;
+  }
+  gfb = gcv->getFramebuffer();
+  gW = ew; gH = eh;
+  memset(gfb, 0, (size_t)ew * eh * 2);
+  gfx->fillScreen(C_BLACK);
+  mode = MODE_GIF;
+  nextFrameAt = 0;
+  return true;
+}
+
+void openGif() {
+  if (startGif()) return;
+  tcv->fillScreen(C_BLACK);
+  centerText("No GIF yet", 233, 215, 4, C_WHITE);
+  centerText("Send one from the", 233, 275, 2, C_LGRAY);
+  centerText("phone page", 233, 300, 2, C_LGRAY);
+  tcv->flush();
+  delay(1800);
+  goGrid();
+}
+
+void saveGif() {
+  if (!fsOK) return;
+  File f = LittleFS.open("/anim.gif", "w");
+  if (f) { f.write(playBuf, playSize); f.close(); }
+}
+
+bool loadSavedGif() {
+  if (!fsOK || !LittleFS.exists("/anim.gif")) return false;
+  File f = LittleFS.open("/anim.gif", "r");
+  if (!f) return false;
+  size_t n = f.size();
+  if (n == 0 || n > MAX_GIF) { f.close(); return false; }
+  f.read(playBuf, n);
+  f.close();
+  playSize = n;
+  return true;
+}
+
+// ================= Timer app =================
+void drawSetScreen(int m) {
+  tcv->fillScreen(C_BLACK);
+  for (int k = 1; k <= 60; k++)
+    ringDot(k * 6, 212, (k % 5 == 0) ? 8 : 4, (m >= 1 && k <= m) ? C_ORANGE : C_GRAY);
+  char buf[8];
+  if (m < 0) {
+    centerText("Touch and", 233, 205, 3, C_WHITE);
+    centerText("slide", 233, 245, 3, C_WHITE);
+  } else if (m > 0) {
+    snprintf(buf, sizeof(buf), "%d", m);
+    centerText(buf, 233, 215, 12, C_WHITE);
+    centerText("min", 233, 295, 4, C_ORANGE);
+  } else {
+    centerText("X", 233, 220, 10, C_PINK);
+    centerText("cancel", 233, 295, 3, C_PINK);
+  }
+  tcv->flush();
+}
+
+void drawTimerScreen() {
+  long rem = (long)(timerEndMs - millis());
+  if (rem < 0) rem = 0;
+  float frac = (float)rem / (float)timerTotalMs;
+  tcv->fillScreen(C_BLACK);
+  drawRing(360, C_GRAY);
+  drawRing(360.0f * frac, C_ORANGE);
+  int secs = (rem + 999) / 1000;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%02d:%02d", secs / 60, secs % 60);
+  centerText(buf, 233, 233, 8, C_WHITE);
+  tcv->flush();
+}
+
+void drawAlarm(bool on) {
+  tcv->fillScreen(C_BLACK);
+  drawRing(360, on ? C_ORANGE : C_GRAY);
+  centerText("TIME!", 233, 233, 9, on ? C_WHITE : C_ORANGE);
+  tcv->flush();
+}
+
+void updateSet(int x, int y) {
+  float dx = x - 233, dy = y - 233;
+  int m;
+  if (sqrtf(dx * dx + dy * dy) < 70) {
+    m = 0;                                   // centre = cancel
+  } else {
+    float deg = atan2f(dx, -dy) * 180.0f / PI;   // clockwise from the top
+    if (deg < 0) deg += 360;
+    m = (int)roundf(deg / 6.0f);
+    if (m == 0) m = 60;
+  }
+  if (m != setMin) { setMin = m; drawSetScreen(m); }
+}
+
+void openTimerApp() {
+  if (timerActive) {
+    mode = MODE_TIMER;
+    lastSec = -1;
+  } else {
+    mode = MODE_SET;
+    setMin = -99;
+    drawSetScreen(-1);
+  }
+}
+
+void finishSet() {
+  if (setMin >= 1) {
+    timerTotalMs = (uint32_t)setMin * 60000UL;
+    timerEndMs = millis() + timerTotalMs;
+    timerActive = true;
+    lastSec = -1;
+    mode = MODE_TIMER;
+    drawTimerScreen();
+  } else {
+    goGrid();
+  }
+}
+
+void startAlarm() {
+  timerActive = false;
+  mode = MODE_ALARM;
+  alarmStart = millis();
+  lastFlash = 0;
+  flashOn = false;
+  digitalWrite(PA_PIN, HIGH);
+}
+
+void stopAlarm() {
+  beepOn = false;
+  digitalWrite(PA_PIN, LOW);
+  goClock();
+}
+
+// ================= BLE =================
+void notifyStatus(const char *msg) {
+  if (!ctrlChar) return;
+  ctrlChar->setValue((uint8_t *)msg, strlen(msg));
+  ctrlChar->notify();
+}
+
+class ServerCB : public BLEServerCallbacks {
+  void onDisconnect(BLEServer *s) override { BLEDevice::startAdvertising(); }
 };
 
-// ---------- GIF encoder library (loaded only when needed) ----------
-let gifencLib = null;
-async function loadGifenc() {
-  if (gifencLib) return gifencLib;
-  const urls = [
-    'https://cdn.jsdelivr.net/npm/gifenc@1.0.3/dist/gifenc.esm.js',
-    'https://unpkg.com/gifenc@1.0.3/dist/gifenc.esm.js'
-  ];
-  for (const u of urls) {
-    try { gifencLib = await import(u); return gifencLib; } catch (e) { /* try next */ }
+class CtrlCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    std::string cmd((char *)c->getData(), c->getLength());
+    if (cmd.rfind("START:", 0) == 0) {
+      size_t n = (size_t)atol(cmd.c_str() + 6);
+      if (n == 0 || n > MAX_GIF || !rxBuf) {
+        receiving = false;
+        notifyStatus("ERR:size");
+        return;
+      }
+      gifExpected = n;
+      gifReceived = 0;
+      receiving = true;
+      notifyStatus("READY");
+    } else if (cmd == "END") {
+      if (receiving && gifReceived == gifExpected) {
+        receiving = false;
+        newGifReady = true;
+        notifyStatus("OK");
+      } else {
+        receiving = false;
+        notifyStatus("ERR:len");
+      }
+    } else if (cmd == "FACE") {
+      cmdFace = true;
+    } else if (cmd == "GIF") {
+      cmdGif = true;
+    } else if (cmd.rfind("TIME:", 0) == 0) {
+      // TIME:<unix seconds>:<utc offset in minutes>
+      long long ep = 0; int off = 0;
+      if (sscanf(cmd.c_str() + 5, "%lld:%d", &ep, &off) >= 1) {
+        struct timeval tv;
+        tv.tv_sec = (time_t)(ep + (long long)off * 60);   // store LOCAL time
+        tv.tv_usec = 0;
+        settimeofday(&tv, nullptr);
+        timeSet = true;
+        forceClock = true;
+      }
+    }
   }
-  throw new Error('could not load the GIF encoder (no internet?)');
+};
+
+class DataCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    if (!receiving) return;
+    size_t len = c->getLength();
+    if (gifReceived + len > gifExpected) {
+      receiving = false;
+      notifyStatus("ERR:overflow");
+      return;
+    }
+    memcpy(rxBuf + gifReceived, c->getData(), len);
+    gifReceived += len;
+  }
+};
+
+void setupBLE() {
+  BLEDevice::init("Companion");
+  BLEDevice::setMTU(247);
+  BLEServer *srv = BLEDevice::createServer();
+  srv->setCallbacks(new ServerCB());
+  BLEService *svc = srv->createService(SERVICE_UUID);
+  ctrlChar = svc->createCharacteristic(
+    CTRL_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  ctrlChar->addDescriptor(new BLE2902());
+  ctrlChar->setCallbacks(new CtrlCB());
+  BLECharacteristic *dataChar = svc->createCharacteristic(
+    DATA_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  dataChar->setCallbacks(new DataCB());
+  svc->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
 }
 
-// ---------- Decode + crop to circle ----------
-function renderBase(image) {
-  const c = document.createElement('canvas');
-  c.width = c.height = BASE;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, BASE, BASE);
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(BASE / 2, BASE / 2, BASE / 2, 0, Math.PI * 2);
-  ctx.clip();
-  const iw = image.displayWidth || image.width, ih = image.displayHeight || image.height;
-  const scale = $('fit').value === 'fill'
-    ? Math.max(BASE / iw, BASE / ih)
-    : BASE / Math.hypot(iw, ih);               // whole picture inside the circle
-  const dw = iw * scale, dh = ih * scale;
-  ctx.drawImage(image, (BASE - dw) / 2, (BASE - dh) / 2, dw, dh);
-  ctx.restore();
-  return c;
+// ================= Touch gestures =================
+void onSwipe(int dir) {            // dir < 0: finger moved left, dir > 0: moved right
+  switch (mode) {
+    case MODE_CLOCK: if (dir < 0) goGrid(); break;
+    case MODE_GRID:  if (dir > 0) goClock(); break;
+    case MODE_FACE:
+    case MODE_GIF:
+    case MODE_TIMER: if (dir > 0) goGrid(); break;
+    default: break;
+  }
 }
 
-async function decodeFrames(file, bytes) {
-  const type = file.type || 'image/gif';
-  if (!(await ImageDecoder.isTypeSupported(type))) throw new Error('file type not supported');
-  const decoder = new ImageDecoder({ data: bytes, type });
-  await decoder.tracks.ready;
-  const n = decoder.tracks.selectedTrack.frameCount;
-  const step = Math.max(1, Math.ceil(n / MAX_FRAMES));
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const { image } = await decoder.decode({ frameIndex: i });
-    const d = image.duration ? image.duration / 1000 : 100;   // µs -> ms
-    if (i % step === 0) {
-      const bmp = await createImageBitmap(renderBase(image));
-      out.push({ bmp, delay: d });
+void onTap(int x, int y) {
+  switch (mode) {
+    case MODE_CLOCK:
+      digitalFace = !digitalFace;
+      forceClock = true;
+      break;
+    case MODE_GRID: {
+      int t = hitTile(x, y);
+      if (t == 0) openTimerApp();
+      else if (t == 1) goFace();
+      else if (t == 2) openGif();
+      break;
+    }
+    case MODE_FACE:
+      nextEvent = 0;               // tap = blink / yawn now
+      break;
+    default: break;
+  }
+}
+
+void handleTouch() {
+  static bool wasTouch = false, ignoreTouch = false;
+  static uint32_t touchStart = 0, lastPoll = 0;
+  static int sx = 0, sy = 0, lx = 0, ly = 0;
+
+  uint32_t now = millis();
+  if (now - lastPoll < 20) return;
+  lastPoll = now;
+
+  int x, y;
+  bool t = readTouch(x, y);
+
+  if (t && !wasTouch) {                       // finger down
+    touchStart = now;
+    sx = x; sy = y;
+    ignoreTouch = false;
+    if (mode == MODE_ALARM) { stopAlarm(); ignoreTouch = true; }
+  }
+  if (t) {
+    lx = x; ly = y;
+    if (!ignoreTouch && mode == MODE_SET) updateSet(lx, ly);   // dial follows the finger
+  }
+  if (!t && wasTouch && !ignoreTouch) {       // finger up
+    if (mode == MODE_SET) {
+      finishSet();
     } else {
-      out[out.length - 1].delay += d;
+      int dx = lx - sx, dy = ly - sy;
+      if (abs(dx) > 70 && abs(dx) > abs(dy) * 3 / 2) onSwipe(dx < 0 ? -1 : 1);
+      else if (abs(dx) < 25 && abs(dy) < 25 && now - touchStart < 600) onTap(lx, ly);
     }
-    image.close();
-    if (i % 5 === 0) { log('Reading frames… ' + (i + 1) + '/' + n); await sleep(0); }
   }
-  decoder.close();
-  if (out.length === 1) out[0].delay = 100;
-  return out;
+  wasTouch = t;
 }
 
-async function encodeGif(frames, S, lib) {
-  const { GIFEncoder, quantize, applyPalette } = lib;
-  const c = document.createElement('canvas');
-  c.width = c.height = S;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  const g = GIFEncoder();
-  for (let i = 0; i < frames.length; i++) {
-    ctx.drawImage(frames[i].bmp, 0, 0, S, S);
-    const { data } = ctx.getImageData(0, 0, S, S);
-    const palette = quantize(data, 256);
-    const index = applyPalette(data, palette);
-    g.writeFrame(index, S, S, { palette, delay: Math.max(20, Math.round(frames[i].delay)) });
-    if (i % 3 === 0) { log('Building GIF at ' + S + '×' + S + '… ' + (i + 1) + '/' + frames.length); await sleep(0); }
-  }
-  g.finish();
-  return g.bytes();
+// ================= Setup / loop =================
+void setup() {
+  pinMode(PWR_EN, OUTPUT);
+  digitalWrite(PWR_EN, HIGH);        // keep the board powered
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+  Serial.begin(115200);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  gfx->begin();
+  gfx->setBrightness(200);
+  gfx->fillScreen(C_BLACK);
+  cv->begin(GFX_SKIP_OUTPUT_BEGIN);
+  tcv->begin(GFX_SKIP_OUTPUT_BEGIN);
+
+  rxBuf = (uint8_t *)ps_malloc(MAX_GIF);
+  playBuf = (uint8_t *)ps_malloc(MAX_GIF);
+
+  fsOK = LittleFS.begin(true);
+  gif.begin(GIF_PALETTE_RGB565_LE);
+  loadSavedGif();                    // keeps the last GIF ready for the GIF app
+  setupAudio();
+  setupBLE();
+
+  mode = MODE_CLOCK;
+  forceClock = true;
 }
 
-function halve(frames) {
-  const out = [];
-  for (let i = 0; i < frames.length; i += 2) {
-    const b = frames[i + 1];
-    out.push({ bmp: frames[i].bmp, delay: frames[i].delay + (b ? b.delay : 0) });
+void loop() {
+  // New GIF finished arriving over Bluetooth: show it right away
+  if (newGifReady) {
+    newGifReady = false;
+    gif.close();
+    uint8_t *tmp = playBuf; playBuf = rxBuf; rxBuf = tmp;
+    playSize = gifExpected;
+    saveGif();
+    if (!startGif()) { notifyStatus("ERR:gif"); goGrid(); }
+    else notifyStatus("PLAY");
   }
-  return out;
-}
+  if (cmdFace) { cmdFace = false; goFace(); }
+  if (cmdGif)  { cmdGif = false; openGif(); }
 
-// ---------- File chosen ----------
-let currentFile = null;
-async function prepare() {
-  const file = currentFile;
-  if (!file) return;
-  busy = true; refreshButtons();
-  outBytes = null;
-  try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    let note = file.name + ' — original ' + (bytes.length / 1024).toFixed(0) + ' KB';
+  handleTouch();
 
-    if (!$('opt').checked || typeof ImageDecoder === 'undefined') {
-      if ($('opt').checked) note += '\n⚠ This browser cannot resize (use Chrome/Edge). Sending the original.';
-      outBytes = bytes;
-      if (bytes.length > MAX_BYTES) note += '\n⚠ Over 1 MB, the board will reject it.';
-      $('info').textContent = note;
-      $('preview').src = URL.createObjectURL(file);
-      log('Ready to send.');
-      return;
+  // Timer finished?
+  if (timerActive && (long)(millis() - timerEndMs) >= 0) startAlarm();
+
+  // BOOT button
+  static bool lastBtn = true;
+  static uint32_t lastPress = 0;
+  bool b = digitalRead(BOOT_BTN);
+  if (!b && lastBtn && millis() - lastPress > 300) {
+    lastPress = millis();
+    if (mode == MODE_ALARM) stopAlarm();
+    else if (mode == MODE_TIMER) { timerActive = false; goGrid(); }   // cancel timer
+    else if (mode == MODE_CLOCK) goGrid();
+    else goClock();
+  }
+  lastBtn = b;
+
+  switch (mode) {
+    case MODE_CLOCK: {
+      long key = timeSet ? (long)time(nullptr) : (long)(millis() / 1000);
+      if (forceClock || key != lastClockKey) {
+        forceClock = false;
+        lastClockKey = key;
+        drawClock();
+      }
+      break;
     }
 
-    const lib = await loadGifenc();
-    let frames = await decodeFrames(file, bytes);
-    let S = even(parseInt($('size').value, 10));
-    let result = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      result = await encodeGif(frames, S, lib);
-      if (result.length <= TARGET_BYTES) break;
-      if (S > 260) S = even(S * 0.85);
-      else if (frames.length > 2) frames = halve(frames);
-      else S = even(S * 0.8);
+    case MODE_GIF:
+      if (millis() >= nextFrameAt) {
+        int d = 0;
+        int r = gif.playFrame(false, &d);
+        if (gcv) gcv->flush();
+        nextFrameAt = millis() + (d > 20 ? d : 20);
+        if (r == 0) gif.reset();
+        else if (r < 0) goGrid();
+      }
+      break;
+
+    case MODE_TIMER: {
+      long secsNow = ((long)(timerEndMs - millis()) + 999) / 1000;
+      if (secsNow != lastSec) { lastSec = secsNow; drawTimerScreen(); }
+      break;
     }
-    outBytes = result;
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(new Blob([result], { type: 'image/gif' }));
-    $('preview').src = previewUrl;
-    note += '\nReady: ' + S + '×' + S + ' px, ' + frames.length + ' frame(s), ' + (result.length / 1024).toFixed(0) + ' KB';
-    if (result.length > MAX_BYTES) note += '\n⚠ Still over 1 MB, the board will reject it. Try a smaller size.';
-    $('info').textContent = note;
-    log('Ready to send.');
-  } catch (e) {
-    log('Resize failed: ' + e.message + '\nTurn off "Optimize" to send the original file.');
-  } finally {
-    busy = false; refreshButtons();
+
+    case MODE_ALARM: {
+      uint32_t t = millis() - alarmStart;
+      uint32_t phase = t % 1600;
+      beepOn = (phase < 1000) && ((phase / 200) % 2 == 0);   // beep-beep-beep ... pause
+      if (t - lastFlash >= 400 || lastFlash == 0) {
+        lastFlash = t ? t : 1;
+        flashOn = !flashOn;
+        drawAlarm(flashOn);
+      }
+      if (t > 60000) stopAlarm();                            // auto-stop after 1 minute
+      break;
+    }
+
+    case MODE_FACE:
+      if (millis() >= nextEvent) {
+        if (random(5) == 0) yawn(); else blinkEyes();
+        nextEvent = millis() + random(2000, 6000);
+      }
+      break;
+
+    default:   // MODE_GRID, MODE_SET: screens are drawn when entered / touched
+      break;
   }
 }
-
-$('file').onchange = e => { currentFile = e.target.files[0] || null; prepare(); };
-$('opt').onchange = $('fit').onchange = $('size').onchange = () => prepare();
-
-// ---------- Sending ----------
-async function writeCtrl(text) { await ctrl.writeValue(enc.encode(text)); }
-function waitStatus(ms = 15000) {
-  return new Promise((res, rej) => {
-    const t = setTimeout(() => { waiting = null; rej(new Error('timeout waiting for board')); }, ms);
-    waiting = m => { clearTimeout(t); res(m); };
-  });
-}
-async function writeChunk(chunk) {
-  for (let tries = 0; tries < 50; tries++) {
-    try {
-      if (data.writeValueWithoutResponse) await data.writeValueWithoutResponse(chunk);
-      else await data.writeValue(chunk);
-      return;
-    } catch (e) { await sleep(10); }
-  }
-  throw new Error('write failed');
-}
-
-$('send').onclick = async () => {
-  if (!outBytes) return;
-  busy = true; refreshButtons();
-  try {
-    const size = outBytes.length;
-    const step = parseInt($('chunk').value, 10);
-    let w = waitStatus();
-    await writeCtrl('START:' + size);
-    const r = await w;
-    if (r !== 'READY') throw new Error('board said ' + r);
-
-    const t0 = performance.now();
-    for (let i = 0; i < size; i += step) {
-      await writeChunk(outBytes.slice(i, Math.min(i + step, size)));
-      const pct = Math.min(100, Math.round((i + step) / size * 100));
-      $('bar').value = pct;
-      if ((i / step) % 20 === 0) log('Sending… ' + pct + '%');
-    }
-    await sleep(150);
-    w = waitStatus(20000);
-    await writeCtrl('END');
-    const res = await w;
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    log(res === 'OK' ? 'Sent in ' + secs + ' s. Saving and playing…' : 'Board said: ' + res);
-  } catch (e) { log('Send failed: ' + e.message); }
-  busy = false; refreshButtons();
-};
-
-$('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
-$('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
-</script>
-</body>
-</html>
