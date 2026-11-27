@@ -75,6 +75,7 @@
         <option value="240">240 (fastest)</option>
       </select>
     </div>
+    <label><input type="checkbox" id="gifSave"> Remember it after the watch restarts (slower, a few seconds)</label>
     <button id="send" disabled>Send GIF</button>
     <progress id="bar" value="0" max="100"></progress>
     <div class="small" style="margin-top:8px">Shrinks automatically if over 1 MB. Needs Chrome/Edge and internet for this step.</div>
@@ -414,7 +415,9 @@ $('send').onclick = async () => {
     const size = outBytes.length;
     const step = parseInt($('chunk').value, 10);
     let w = waitStatus();
-    await writeCtrl('START:' + size);
+    for (let a = 0; ; a++) {                       // retry once if the first write is refused
+      try { await writeCtrl('START:' + size); break; } catch (e) { if (a >= 1) throw e; await sleep(600); }
+    }
     const r = await w;
     if (r !== 'READY') throw new Error('board said ' + r);
 
@@ -430,7 +433,8 @@ $('send').onclick = async () => {
     await writeCtrl('END');
     const res = await w;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    log(res === 'OK' ? 'Sent in ' + secs + ' s. Saving and playing…' : 'Board said: ' + res);
+    log(res === 'OK' ? 'Sent in ' + secs + ' s. Playing.' : 'Board said: ' + res);
+    if (res === 'OK' && $('gifSave').checked) { await sleep(1500); await writeCtrl('SAVE'); log('Sent in ' + secs + ' s. Playing, and saving it in the background.'); }
   } catch (e) { log('Send failed: ' + e.message); }
   busy = false; refreshButtons();
 };
