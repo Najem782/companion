@@ -502,6 +502,7 @@ function ytBuildChunks(lines) {                          // split every line int
   return out;
 }
 function ytTick() {
+  if (streamRun) return;                                     // while streaming, cues are tied to the audio instead
   if (!ytPlayer || !ytLines.length || !ytPlayer.getCurrentTime) return;
   const st = ytPlayer.getPlayerState();
   if (st !== 1) return;                                       // only while playing
@@ -675,6 +676,13 @@ $('songSend').onclick = async () => {
 
 // ---------- Live sound: this page's audio -> Bluetooth -> watch speaker ----------
 let streamRun = false, streamParts = null;
+let ytLastP = -1, ytLastAt = 0, cueNext = 0, cueLastPt = -1;
+function ytNow() {                                            // smooth player clock (the API only updates a few times a second)
+  const p = ytPlayer.getCurrentTime(), n = performance.now();
+  if (p !== ytLastP) { ytLastP = p; ytLastAt = n; }
+  return p + Math.min(0.5, (n - ytLastAt) / 1000);
+}
+function sendCue(idx, text) { safeCtrl('Q:' + idx + '|' + text.slice(0, 60)); }
 async function streamStop(msgText) {
   if (!streamRun) return;
   streamRun = false;
@@ -705,16 +713,29 @@ async function streamStart() {
     src.connect(node); node.connect(mute); mute.connect(ac.destination);
 
     const RING = 1 << 18, ring = new Uint8Array(RING);
-    let head = 0, tail = 0;
+    let head = 0, tail = 0, dropped = 0;
+    cueNext = 0; cueLastPt = -1;
     node.port.onmessage = e => {
       const f = e.data, stepIn = rate === 8000 ? 2 : 1;
+      const idxHere = head - dropped + Math.round(rate * 0.12);   // where this audio will sit in the stream the watch receives
       for (let i = 0; i + stepIn <= f.length; i += stepIn) {
         let v = stepIn === 2 ? (f[i] + f[i + 1]) / 2 : f[i];
         v = Math.max(-1, Math.min(1, v * 1.2));
         ring[head & (RING - 1)] = lin2ulaw(Math.round(v * 32767));
         head++;
       }
-      if (head - tail > rate * 3) tail = head - rate;          // too far behind: skip ahead
+      if (head - tail > rate * 3) { dropped += (head - rate) - tail; tail = head - rate; }   // too far behind: skip ahead
+      if (ytPlayer && ytLines.length && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) {
+        const pt = ytNow() + (parseFloat($('ytOff').value) || 0);
+        if (cueLastPt >= 0 && (pt < cueLastPt - 0.7 || pt > cueLastPt + 2.5)) {    // seek or big offset change
+          let k = -1;
+          for (let i = 0; i < ytLines.length; i++) { if (ytLines[i][0] <= pt) k = i; else break; }
+          cueNext = k + 1;
+          if (k >= 0) sendCue(idxHere, ytLines[k][1]);
+        }
+        cueLastPt = pt;
+        while (cueNext < ytLines.length && ytLines[cueNext][0] <= pt) { sendCue(idxHere, ytLines[cueNext][1]); cueNext++; }
+      }
     };
     ms.getAudioTracks()[0].addEventListener('ended', () => streamStop('Sharing stopped.'));
 
@@ -724,8 +745,7 @@ async function streamStart() {
     if (r !== 'SREADY') throw new Error('the watch said ' + r);
     streamRun = true; streamParts = { ac, ms };
     $('ytStream').textContent = 'Stop sound on the watch';
-    if ((parseFloat($('ytOff').value) || 0) === 0) $('ytOff').value = '-1.5';   // the watch plays about 1.5 s later
-    ytInfo('Streaming to the watch. If the lyrics are early or late, use the buttons above.');
+    ytInfo('Streaming to the watch. The lyrics are tied to the sound the watch plays. If they are a little early or late, use the buttons above.');
     ytIdx = -9;
     ytPlayer.playVideo();
     (async () => {
