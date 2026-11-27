@@ -108,6 +108,12 @@
     </div>
     <div class="small">Lyrics too fast? Press "Lyrics later", or press the last button at the moment the first line is sung.</div>
     <button id="ytLoad">Load song + lyrics</button>
+    <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+    <b>Sound on the watch speaker (PC, Chrome/Edge)</b>
+    <div class="small">Plays this page's sound on the watch while the lyrics follow it. Load the song above first. In the sharing window choose <b>This tab</b> and tick <b>Also share tab audio</b>.</div>
+    <div class="row"><span class="small">Quality</span>
+      <select id="ytRate"><option value="16000" selected>Better (16 kHz)</option><option value="8000">Safer (8 kHz)</option></select></div>
+    <button id="ytStream" disabled>Play on the watch speaker</button>
     <div id="ytInfo" class="small" style="margin-top:8px"></div>
     <div id="ytBox" style="margin-top:8px"><div id="ytPlayer"></div></div>
   </section>
@@ -174,6 +180,7 @@ function refreshButtons() {
   $('state').classList.toggle('on', on);
   $('face').disabled = $('play').disabled = $('sync').disabled = $('notif').disabled = $('camBtn').disabled = !on;
   $('songSend').disabled = !on || busy;
+  $('ytStream').disabled = !on;
   $('send').disabled = !(on && outBytes && !busy);
 }
 
@@ -375,7 +382,9 @@ document.addEventListener('drop', e => {
 $('opt').onchange = $('fit').onchange = $('size').onchange = () => prepare();
 
 // ---------- Sending ----------
-async function writeCtrl(text) { await ctrl.writeValue(enc.encode(text)); }
+let gattLock = Promise.resolve();                         // all Bluetooth writes go one after another
+function gattWrite(fn) { const p = gattLock.then(fn); gattLock = p.catch(() => {}); return p; }
+async function writeCtrl(text) { await gattWrite(() => ctrl.writeValue(enc.encode(text))); }
 async function syncTime() {
   const epoch = Math.floor(Date.now() / 1000);
   const offsetMin = -new Date().getTimezoneOffset();   // minutes east of UTC
@@ -391,8 +400,7 @@ function waitStatus(ms = 15000) {
 async function writeChunk(chunk) {
   for (let tries = 0; tries < 50; tries++) {
     try {
-      if (data.writeValueWithoutResponse) await data.writeValueWithoutResponse(chunk);
-      else await data.writeValue(chunk);
+      await gattWrite(() => data.writeValueWithoutResponse ? data.writeValueWithoutResponse(chunk) : data.writeValue(chunk));
       return;
     } catch (e) { await sleep(10); }
   }
@@ -553,7 +561,7 @@ $('ytLoad').onclick = async () => {
           ytInfo('Found: ' + hit.trackName + ' - ' + hit.artistName + ' (' + ytLines.length + ' word groups). ' + (extra >= 2 && extra <= 45 ? 'The video is ' + extra.toFixed(0) + ' s longer than the lyrics, so the offset was set to -' + extra.toFixed(0) + ' s. ' : '') + 'Press play in the player.');
         },
         onStateChange: e => {
-          if (e.data === 0) safeCtrl('LYR:END');               // ended
+          if (e.data === 0) { safeCtrl('LYR:END'); if (streamRun) streamStop('Song ended.'); }   // ended
           if (e.data === 1) { ytIdx = -9; }                    // playing again: resend the current line
         }
       }
@@ -664,6 +672,81 @@ $('songSend').onclick = async () => {
   busy = false; refreshButtons();
 };
 
+
+// ---------- Live sound: this page's audio -> Bluetooth -> watch speaker ----------
+let streamRun = false, streamParts = null;
+async function streamStop(msgText) {
+  if (!streamRun) return;
+  streamRun = false;
+  const sp = streamParts; streamParts = null;
+  if (sp) { try { sp.ms.getTracks().forEach(t => t.stop()); sp.ac.close(); } catch (e) {} }
+  try { await writeCtrl('SEND'); } catch (e) {}
+  $('ytStream').textContent = 'Play on the watch speaker';
+  if (msgText) ytInfo(msgText);
+}
+async function streamStart() {
+  if (!ctrl) { ytInfo('Connect to the watch first.'); return; }
+  if (!ytPlayer) { ytInfo('Press "Load song + lyrics" first.'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { ytInfo('This needs Chrome or Edge on a PC. Phones cannot share tab sound.'); return; }
+  let ms;
+  try {
+    ms = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { suppressLocalAudioPlayback: true }, preferCurrentTab: true, selfBrowserSurface: 'include', systemAudio: 'include' });
+  } catch (e) { ytInfo('Sharing was cancelled.'); return; }
+  if (!ms.getAudioTracks().length) { ms.getTracks().forEach(t => t.stop()); ytInfo('No sound was shared. Try again and tick "Also share tab audio".'); return; }
+  ms.getVideoTracks().forEach(t => { t.enabled = false; });
+  try {
+    const rate = parseInt($('ytRate').value, 10);
+    const ac = new AudioContext({ sampleRate: 16000 });
+    const code = "class P extends AudioWorkletProcessor { process(inputs) { const c = inputs[0][0]; if (c) this.port.postMessage(c.slice()); return true; } } registerProcessor('pcm', P);";
+    await ac.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+    const src = ac.createMediaStreamSource(new MediaStream(ms.getAudioTracks()));
+    const node = new AudioWorkletNode(ac, 'pcm', { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: 'explicit' });
+    const mute = ac.createGain(); mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(ac.destination);
+
+    const RING = 1 << 18, ring = new Uint8Array(RING);
+    let head = 0, tail = 0;
+    node.port.onmessage = e => {
+      const f = e.data, stepIn = rate === 8000 ? 2 : 1;
+      for (let i = 0; i + stepIn <= f.length; i += stepIn) {
+        let v = stepIn === 2 ? (f[i] + f[i + 1]) / 2 : f[i];
+        v = Math.max(-1, Math.min(1, v * 1.2));
+        ring[head & (RING - 1)] = lin2ulaw(Math.round(v * 32767));
+        head++;
+      }
+      if (head - tail > rate * 3) tail = head - rate;          // too far behind: skip ahead
+    };
+    ms.getAudioTracks()[0].addEventListener('ended', () => streamStop('Sharing stopped.'));
+
+    const w = waitStatus(8000);
+    await writeCtrl('SSTART:' + rate);
+    const r = await w;
+    if (r !== 'SREADY') throw new Error('the watch said ' + r);
+    streamRun = true; streamParts = { ac, ms };
+    $('ytStream').textContent = 'Stop sound on the watch';
+    if ((parseFloat($('ytOff').value) || 0) === 0) $('ytOff').value = '-1.5';   // the watch plays about 1.5 s later
+    ytInfo('Streaming to the watch. If the lyrics are early or late, use the buttons above.');
+    ytIdx = -9;
+    ytPlayer.playVideo();
+    (async () => {
+      while (streamRun) {
+        if (head - tail >= 240) {
+          const chunk = new Uint8Array(240);
+          for (let i = 0; i < 240; i++) chunk[i] = ring[(tail + i) & (RING - 1)];
+          tail += 240;
+          try { await writeChunk(chunk); } catch (e) { streamStop('Bluetooth write failed.'); break; }
+        } else {
+          await sleep(8);
+        }
+      }
+    })();
+  } catch (e) {
+    ms.getTracks().forEach(t => t.stop());
+    ytInfo('Could not start: ' + e.message);
+  }
+}
+$('ytStream').onclick = () => (streamRun ? streamStop('Stopped.') : streamStart());
+
 // ---------- Camera mode: blink mirror + "angry when you use the phone" ----------
 let camOn = false, camStream = null, landmarker = null, lastBlinkSent = 0, lastAngrySent = 0, eyesClosed = false, wakeLock = null;
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
@@ -709,8 +792,7 @@ async function sendEye(open) {                           // eye openness 0..100,
   lastEye = open; lastEyeT = now;
   const data = enc.encode('E:' + open);
   try {
-    if (ctrl.writeValueWithoutResponse) await ctrl.writeValueWithoutResponse(data);
-    else { eyeBusy = true; await ctrl.writeValue(data); eyeBusy = false; }
+    await gattWrite(() => ctrl.writeValueWithoutResponse ? ctrl.writeValueWithoutResponse(data) : ctrl.writeValue(data));
   } catch (e) { eyeBusy = false; }
 }
 const ema = (o, v) => o * 0.6 + v * 0.4;
