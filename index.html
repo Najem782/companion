@@ -46,6 +46,8 @@
 <main>
   <section class="card">
     <h2>🖼️ Send a GIF / picture</h2>
+    <div class="row" style="margin:0"><input id="gifUrl" type="text" placeholder="Paste a GIF link (Giphy, imgur, direct .gif...)" style="margin:0"><button id="gifLoad" class="alt" style="margin:0">Load</button></div>
+    <div class="small" style="margin:6px 0">You can also paste a copied image (Ctrl+V), drop a file here, or pick one:</div>
     <input type="file" id="file" accept="image/gif,image/png,image/jpeg,image/webp">
     <div id="info" class="small"></div>
     <img id="preview" alt="">
@@ -107,7 +109,8 @@
     <label><input type="checkbox" id="mAway" checked> I look away / turn my head</label>
     <label><input type="checkbox" id="mGone" checked> my face is not visible for 4 s</label>
     <div class="row"><span class="small">Close limit</span><input type="range" id="mThr" min="15" max="70" value="32" style="flex:1"></div>
-    <div class="row"><span class="small">Look-down limit</span><input type="range" id="mDownThr" min="15" max="90" value="45" style="flex:1"></div>
+    <div class="row"><span class="small">Look-down limit</span><input type="range" id="mDownThr" min="15" max="90" value="35" style="flex:1"></div>
+    <div class="row"><span class="small">Eye-gaze limit</span><input type="range" id="mGazeThr" min="15" max="90" value="35" style="flex:1"></div>
     <div class="row"><span class="small">Look-away limit</span><input type="range" id="mAwayThr" min="8" max="40" value="18" style="flex:1"></div>
     <div class="small">It must last about 1.5 s before the watch gets angry. Lower limit = more sensitive.</div>
     <button id="camBtn" disabled>Start focus mode</button>
@@ -319,6 +322,41 @@ async function prepare() {
 }
 
 $('file').onchange = e => { currentFile = e.target.files[0] || null; prepare(); };
+function giphyDirect(u) {
+  const m = u.match(/giphy\.com\/(?:gifs|stickers|embed)\/(?:[^\/?#]*-)?([A-Za-z0-9]+)(?:[\/?#]|$)/);
+  return m ? 'https://media.giphy.com/media/' + m[1] + '/giphy.gif' : u;
+}
+async function loadFromUrl(u) {
+  u = giphyDirect(u.trim());
+  if (!/^https?:\/\//i.test(u)) { log('Paste a full link starting with https://'); return; }
+  try {
+    log('Downloading the picture...');
+    const r = await fetch(u);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    if (!/^image\//.test(blob.type)) throw new Error('that link is a web page, not a picture. Right-click the GIF and copy the image address.');
+    currentFile = new File([blob], 'link.' + (blob.type.split('/')[1] || 'gif'), { type: blob.type });
+    log('Loaded.');
+    prepare();
+  } catch (e) {
+    log('Could not load that link (' + e.message + '). Some sites block this. Try a direct image link, or download once and pick the file.');
+  }
+}
+$('gifLoad').onclick = () => loadFromUrl($('gifUrl').value);
+$('gifUrl').onkeydown = e => { if (e.key === 'Enter') loadFromUrl($('gifUrl').value); };
+document.addEventListener('paste', e => {
+  const f = [...(e.clipboardData ? e.clipboardData.files : [])].find(x => x.type.startsWith('image/'));
+  if (f) { currentFile = f; prepare(); e.preventDefault(); return; }
+  const t = e.clipboardData ? e.clipboardData.getData('text') : '';
+  if (/^https?:\/\/\S+$/.test(t.trim()) && document.activeElement && document.activeElement.tagName !== 'INPUT' && !/youtu/.test(t)) loadFromUrl(t);
+});
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = [...e.dataTransfer.files].find(x => x.type.startsWith('image/'));
+  if (f) { currentFile = f; prepare(); }
+  else { const t = e.dataTransfer.getData('text'); if (/^https?:\/\//.test(t)) loadFromUrl(t); }
+});
 $('opt').onchange = $('fit').onchange = $('size').onchange = () => prepare();
 
 // ---------- Sending ----------
@@ -418,11 +456,27 @@ async function ytFindLyrics(title, artist, dur) {
   if (dur) arr.sort((a, b) => Math.abs((a.duration || 0) - dur) - Math.abs((b.duration || 0) - dur));
   return arr[0];
 }
-function ytSend(prev, cur, next) {
-  const cut = (t, n) => (t || '').slice(0, n);
-  let msg = 'LYR:' + cut(ytTitleSent, 28) + '|' + cut(prev, 48) + '|' + cut(cur, 60) + '|' + cut(next, 48);
+function ytSend(cur) {
+  let msg = 'LYR:' + (cur || '...').slice(0, 60);
   while (enc.encode(msg).length > 220) msg = msg.slice(0, -1);
   safeCtrl(msg);
+}
+function ytBuildChunks(lines) {                          // split every line into groups of about 3-4 words
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const [t0, text] = lines[i];
+    const words = text.split(/\s+/).filter(Boolean);
+    if (!words.length) continue;
+    const next = lines[i + 1] ? lines[i + 1][0] : t0 + 5;
+    const dur = Math.min(next - t0, Math.max(1.2, words.length * 0.5 + 0.5));
+    const per = Math.ceil(words.length / Math.ceil(words.length / 4));
+    const chunks = [];
+    for (let j = 0; j < words.length; j += per) chunks.push(words.slice(j, j + per).join(' '));
+    const total = chunks.reduce((n, c) => n + c.length, 0) || 1;
+    let acc = 0;
+    for (const c of chunks) { out.push([t0 + dur * acc / total, c]); acc += c.length; }
+  }
+  return out;
 }
 function ytTick() {
   if (!ytPlayer || !ytLines.length || !ytPlayer.getCurrentTime) return;
@@ -434,7 +488,7 @@ function ytTick() {
   const now = performance.now();
   if (idx !== ytIdx || now - ytLastSent > 8000) {
     ytIdx = idx; ytLastSent = now;
-    ytSend(idx > 0 ? ytLines[idx - 1][1] : '', idx >= 0 ? ytLines[idx][1] : '...', ytLines[idx + 1] ? ytLines[idx + 1][1] : '');
+    ytSend(idx >= 0 ? ytLines[idx][1] : '...');
   }
 }
 $('ytUrl').onchange = async () => {
@@ -476,12 +530,12 @@ $('ytLoad').onclick = async () => {
           ytInfo('Looking for synced lyrics...');
           const hit = await ytFindLyrics(title, artist, dur);
           if (!hit) { ytInfo('No synced lyrics found. Check the title and artist, then press Load again.'); ytLines = []; return; }
-          ytLines = ytParseLrc(hit.syncedLyrics);
+          ytLines = ytBuildChunks(ytParseLrc(hit.syncedLyrics));
           ytTitleSent = ytCleanText(title || hit.trackName || 'Song');
           ytIdx = -9;
           const extra = dur - (hit.duration || dur);
           if (extra >= 2 && extra <= 45) { $('ytOff').value = (-extra).toFixed(1); }   // video has an intro
-          ytInfo('Found: ' + hit.trackName + ' - ' + hit.artistName + ' (' + ytLines.length + ' lines). ' + (extra >= 2 && extra <= 45 ? 'The video is ' + extra.toFixed(0) + ' s longer than the lyrics, so the offset was set to -' + extra.toFixed(0) + ' s. ' : '') + 'Press play in the player.');
+          ytInfo('Found: ' + hit.trackName + ' - ' + hit.artistName + ' (' + ytLines.length + ' word groups). ' + (extra >= 2 && extra <= 45 ? 'The video is ' + extra.toFixed(0) + ' s longer than the lyrics, so the offset was set to -' + extra.toFixed(0) + ' s. ' : '') + 'Press play in the player.');
         },
         onStateChange: e => {
           if (e.data === 0) safeCtrl('LYR:END');               // ended
@@ -529,8 +583,20 @@ async function camStart() {
     camLoop();
   } catch (e) { log('Focus mode failed: ' + e.message); camStop(); }
 }
-let lastFace = 0, badSince = 0;
-const SM = { w: 0, down: 0, yaw: 0, side: 0 };
+let lastFace = 0, badSince = 0, lastEye = -99, lastEyeT = 0, eyeBusy = false;
+const SM = { w: 0, down: 0, yaw: 0, side: 0, up: 0 };
+async function sendEye(open) {                           // eye openness 0..100, sent without waiting for a reply
+  const now = performance.now();
+  if (busy || eyeBusy || !ctrl) return;
+  if (Math.abs(open - lastEye) < 5 && now - lastEyeT < 500) return;
+  if (now - lastEyeT < 35) return;
+  lastEye = open; lastEyeT = now;
+  const data = enc.encode('E:' + open);
+  try {
+    if (ctrl.writeValueWithoutResponse) await ctrl.writeValueWithoutResponse(data);
+    else { eyeBusy = true; await ctrl.writeValue(data); eyeBusy = false; }
+  } catch (e) { eyeBusy = false; }
+}
 const ema = (o, v) => o * 0.6 + v * 0.4;
 function camLoop() {
   if (!camOn) return;
@@ -548,21 +614,21 @@ function camLoop() {
       const g = n => { const c = cats.find(x => x.categoryName === n); return c ? c.score : 0; };
       const blink = (g('eyeBlinkLeft') + g('eyeBlinkRight')) / 2;
       const closed = blink > 0.5;
-      if ($('mBlink').checked && closed && !eyesClosed && now - lastBlinkSent > 500) { lastBlinkSent = now; safeCtrl('BLINK'); }
-      eyesClosed = closed;
+      if ($('mBlink').checked) sendEye(Math.round(100 * (1 - Math.min(1, Math.max(0, (blink - 0.12) / 0.55)))));   // mirror my eyelids live
 
       SM.w = ema(SM.w, (maxX - minX) * 100);                                   // face width in % of the frame
       const l = lm[234].x, rr = lm[454].x;
       SM.yaw = ema(SM.yaw, Math.abs((lm[1].x - l) / (rr - l) - 0.5) * 100);   // 0 = facing the camera
       if (blink < 0.35) {                                                      // eye gaze is unreliable during a blink
         SM.down = ema(SM.down, (g('eyeLookDownLeft') + g('eyeLookDownRight')) / 2 * 100);
+        SM.up = ema(SM.up, (g('eyeLookUpLeft') + g('eyeLookUpRight')) / 2 * 100);
         SM.side = ema(SM.side, Math.max((g('eyeLookOutLeft') + g('eyeLookInRight')) / 2, (g('eyeLookInLeft') + g('eyeLookOutRight')) / 2) * 100);
       }
       if ($('mClose').checked && SM.w > +$('mThr').value) reason = 'phone close';
       else if ($('mDown').checked && SM.down > +$('mDownThr').value) reason = 'looking down';
-      else if ($('mAway').checked && (SM.yaw > +$('mAwayThr').value || SM.side > 60)) reason = 'looking away';
+      else if ($('mAway').checked && (SM.yaw > +$('mAwayThr').value || SM.side > +$('mGazeThr').value || SM.up > +$('mGazeThr').value)) reason = 'looking away';
       info = 'Close ' + SM.w.toFixed(0) + '/' + $('mThr').value + '  Down ' + SM.down.toFixed(0) + '/' + $('mDownThr').value +
-             '  Turn ' + SM.yaw.toFixed(0) + '/' + $('mAwayThr').value;
+             '  Turn ' + SM.yaw.toFixed(0) + '/' + $('mAwayThr').value + '  Gaze ' + Math.max(SM.side, SM.up).toFixed(0) + '/' + $('mGazeThr').value;
     } else {
       info = 'No face seen';
       if ($('mGone').checked && now - lastFace > 4000) reason = 'face not visible';
@@ -575,7 +641,9 @@ function camLoop() {
     }
     $('camInfo').textContent = info + (reason ? '  -> ' + reason : '  -> focused');
   }
-  setTimeout(camLoop, 80);
+  const vv = $('cam');
+  if (vv.requestVideoFrameCallback) vv.requestVideoFrameCallback(() => camLoop());
+  else setTimeout(camLoop, 40);
 }
 document.addEventListener('visibilitychange', () => {
   if (camOn && document.hidden && $('mGuard').checked) safeCtrl('ANGRY');   // you left this page
