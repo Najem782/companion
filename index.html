@@ -81,7 +81,21 @@
   </section>
 
   <section class="card">
-    <h2>🎵 YouTube lyrics</h2>
+    <h2>🔊 Song on the watch speaker</h2>
+    <div class="small">Sent over Bluetooth and played by the watch. The lyrics are found automatically and follow the song exactly, because the watch itself keeps the time. Use an audio file you own or a direct audio link (.mp3). YouTube links can't be downloaded.</div>
+    <input id="songUrl" type="text" placeholder="Direct audio link (.mp3 ...) or pick a file below">
+    <input type="file" id="songFile" accept="audio/*">
+    <input id="songTitle" type="text" placeholder="Song title (used to find lyrics)">
+    <input id="songArtist" type="text" placeholder="Artist">
+    <label><input type="checkbox" id="songLyr" checked> Find lyrics automatically</label>
+    <div class="row"><span class="small">Lyrics delay (s) (+ later, - earlier)</span><input id="songOff" type="number" step="0.5" value="0" style="width:80px"></div>
+    <button id="songSend" disabled>Send song to watch</button>
+    <progress id="songBar" value="0" max="100"></progress>
+    <div id="songInfo" class="small" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card">
+    <h2>🎵 YouTube lyrics only</h2>
     <div class="small">The song plays here. The lyrics follow it on the watch.</div>
     <input id="ytUrl" type="text" placeholder="Paste a YouTube link">
     <input id="ytTitle" type="text" placeholder="Song title">
@@ -159,6 +173,7 @@ function refreshButtons() {
   $('state').textContent = on ? 'connected' : 'not connected';
   $('state').classList.toggle('on', on);
   $('face').disabled = $('play').disabled = $('sync').disabled = $('notif').disabled = $('camBtn').disabled = !on;
+  $('songSend').disabled = !on || busy;
   $('send').disabled = !(on && outBytes && !busy);
 }
 
@@ -546,6 +561,107 @@ $('ytLoad').onclick = async () => {
     if (ytTimer) clearInterval(ytTimer);
     ytTimer = setInterval(ytTick, 250);
   } catch (e) { ytInfo('Error: ' + e.message); }
+};
+
+
+// ---------- Song over Bluetooth: played by the watch speaker, lyrics synced by the watch ----------
+const SONG_RATE = 16000, SONG_MAX_SEC = 180;
+function lin2ulaw(v) {
+  const BIAS = 0x84, CLIP = 32635;
+  const sign = (v >> 8) & 0x80;
+  if (sign) v = -v;
+  if (v > CLIP) v = CLIP;
+  v += BIAS;
+  let exp = 7;
+  for (let m = 0x4000; (v & m) === 0 && exp > 0; m >>= 1) exp--;
+  return (~(sign | (exp << 4) | ((v >> (exp + 3)) & 0x0F))) & 0xFF;
+}
+function guessFromName(name) {
+  name = name.replace(/\.[^.]+$/, '').replace(/[\(\[].*?[\)\]]/g, '').replace(/_/g, ' ').trim();
+  const p = name.split(/\s+-\s+/);
+  return p.length >= 2 ? { artist: p[0].trim(), title: p.slice(1).join(' - ').trim() } : { artist: '', title: name };
+}
+$('songFile').onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const g = guessFromName(f.name);
+  $('songTitle').value = g.title; $('songArtist').value = g.artist;
+};
+async function getSongBytes() {
+  const f = $('songFile').files[0];
+  if (f) return { buf: await f.arrayBuffer(), name: f.name };
+  const u = $('songUrl').value.trim();
+  if (!u) throw new Error('Pick an audio file or paste a direct audio link.');
+  if (/youtu\.?be/i.test(u)) throw new Error("YouTube links can't be downloaded. Use an audio file, or the YouTube lyrics box to show lyrics while it plays elsewhere.");
+  const r = await fetch(u);
+  if (!r.ok) throw new Error('download failed (HTTP ' + r.status + ')');
+  if (/text\/html/.test(r.headers.get('content-type') || '')) throw new Error('that link is a web page, not an audio file.');
+  return { buf: await r.arrayBuffer(), name: decodeURIComponent(u.split('/').pop().split('?')[0]) };
+}
+$('songSend').onclick = async () => {
+  const info = t => { $('songInfo').textContent = t; };
+  busy = true; refreshButtons(); $('songBar').value = 0;
+  try {
+    const { buf, name } = await getSongBytes();
+    info('Decoding the song...');
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const audio = await ac.decodeAudioData(buf);
+    const sec = Math.min(audio.duration, SONG_MAX_SEC);
+    const oc = new OfflineAudioContext(1, Math.ceil(sec * SONG_RATE), SONG_RATE);
+    const src = oc.createBufferSource();
+    src.buffer = audio; src.connect(oc.destination); src.start(0);
+    const pcm = (await oc.startRendering()).getChannelData(0);
+    let peak = 0.001;
+    for (let i = 0; i < pcm.length; i += 7) peak = Math.max(peak, Math.abs(pcm[i]));
+    const gain = Math.min(4, 0.95 / peak);
+    const out = new Uint8Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) out[i] = lin2ulaw(Math.round(Math.max(-1, Math.min(1, pcm[i] * gain)) * 32767));
+
+    const g = guessFromName(name);
+    const title = ($('songTitle').value.trim() || g.title || 'Song');
+    const artist = ($('songArtist').value.trim() || g.artist);
+    $('songTitle').value = title; $('songArtist').value = artist;
+    let chunks = [];
+    if ($('songLyr').checked) {
+      info('Looking for synced lyrics...');
+      try {
+        const hit = await ytFindLyrics(title, artist, audio.duration);
+        if (hit) chunks = ytBuildChunks(ytParseLrc(hit.syncedLyrics)); else info('No synced lyrics found. Sending the song only.');
+      } catch (e) { info('Lyrics lookup failed. Sending the song only.'); }
+    }
+
+    let w = waitStatus(10000);
+    await writeCtrl('MBEGIN:' + out.length + '|' + ytCleanText(title).slice(0, 40));
+    const r0 = await w;
+    if (r0 !== 'MREADY') throw new Error(r0 === 'ERR:mem' ? 'The watch has no free memory for this song. Try a shorter one.' : 'the watch said ' + r0);
+
+    const delay = parseFloat($('songOff').value) || 0;
+    let batch = '';
+    for (const [t, txt] of chunks.slice(0, 500)) {
+      const line = Math.max(0, Math.round((t + delay) * 1000)) + '|' + txt.slice(0, 60) + '\n';
+      if (enc.encode('ML:' + batch + line).length > 200) { await writeCtrl('ML:' + batch); batch = ''; }
+      batch += line;
+    }
+    if (batch) await writeCtrl('ML:' + batch);
+
+    const step = parseInt($('chunk').value, 10);
+    const t0 = performance.now();
+    for (let i = 0; i < out.length; i += step) {
+      await writeChunk(out.slice(i, Math.min(i + step, out.length)));
+      if ((i / step) % 40 === 0) {
+        const pct = Math.min(100, Math.round(i / out.length * 100));
+        $('songBar').value = pct;
+        info('Sending to the watch... ' + pct + '% (' + Math.round(sec) + ' s song)');
+      }
+    }
+    await sleep(300);
+    w = waitStatus(20000);
+    await writeCtrl('MEND');
+    const res = await w;
+    $('songBar').value = 100;
+    info(res === 'MOK' ? 'Done in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Playing on the watch' + (chunks.length ? ' with lyrics.' : '.') : 'The watch said: ' + res);
+  } catch (e) { info('Failed: ' + e.message); }
+  busy = false; refreshButtons();
 };
 
 // ---------- Camera mode: blink mirror + "angry when you use the phone" ----------
