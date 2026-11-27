@@ -74,6 +74,17 @@
   <button id="notif" class="alt" disabled>Send test notification</button>
 </div>
 <div style="margin-top:14px;padding:10px;border:1px solid #444;border-radius:10px">
+  <b>YouTube lyrics</b>
+  <div class="small">The song plays here on your phone/PC. The lyrics follow it on the watch.</div>
+  <input id="ytUrl" type="text" placeholder="Paste a YouTube link" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
+  <input id="ytTitle" type="text" placeholder="Song title" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
+  <input id="ytArtist" type="text" placeholder="Artist" style="width:100%;box-sizing:border-box;margin:4px 0;padding:8px">
+  <label class="small">Lyrics offset (seconds) <input id="ytOff" type="number" step="0.5" value="0" style="width:70px"></label>
+  <div><button id="ytLoad" class="alt">Load song + lyrics</button></div>
+  <div id="ytInfo" class="small"></div>
+  <div id="ytBox" style="margin-top:8px"><div id="ytPlayer"></div></div>
+</div>
+<div style="margin-top:14px;padding:10px;border:1px solid #444;border-radius:10px">
   <b>Focus mode</b>
   <div class="small">The watch shows its face. When the front camera sees you holding the phone close, or you leave this page, the face gets angry. Video stays on the phone, nothing is uploaded.</div>
   <label><input type="checkbox" id="mBlink" checked> Blink with me</label><br>
@@ -328,6 +339,111 @@ $('send').onclick = async () => {
 $('sync').onclick = () => syncTime().catch(e => log(e.message));
 $('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
 $('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
+
+
+// ---------- YouTube lyrics: song plays here, lyrics are sent to the watch ----------
+let ytPlayer = null, ytLines = [], ytTimer = null, ytIdx = -9, ytLastSent = 0, ytTitleSent = '';
+const ytInfo = t => { $('ytInfo').textContent = t; };
+function ytCleanText(t) {
+  return t.normalize('NFC').replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, '-')
+    .replace(/\|/g, '/').replace(/[^\x20-\x7E\xA0-\xFF]/g, '?').trim();
+}
+function ytVideoId(u) {
+  const m = u.match(/(?:youtu\.be\/|v=|\/embed\/|\/shorts\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+function ytLoadApi() {
+  return new Promise(res => {
+    if (window.YT && window.YT.Player) return res();
+    window.onYouTubeIframeAPIReady = () => res();
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  });
+}
+function ytParseLrc(text) {
+  const tag = /\[(\d+):(\d+(?:\.\d+)?)\]/g, out = [];
+  for (const ln of text.split(/\r?\n/)) {
+    const st = [...ln.matchAll(tag)];
+    const txt = ytCleanText(ln.replace(tag, ''));
+    if (!st.length || !txt) continue;
+    for (const m of st) out.push([parseInt(m[1]) * 60 + parseFloat(m[2]), txt]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+async function ytFindLyrics(title, artist, dur) {
+  const get = async url => { const r = await fetch(url); return r.ok ? r.json() : []; };
+  let arr = await get('https://lrclib.net/api/search?' + new URLSearchParams({ track_name: title, artist_name: artist }));
+  if (!arr.length) arr = await get('https://lrclib.net/api/search?q=' + encodeURIComponent((artist + ' ' + title).trim()));
+  arr = arr.filter(x => x.syncedLyrics);
+  if (!arr.length) return null;
+  if (dur) arr.sort((a, b) => Math.abs((a.duration || 0) - dur) - Math.abs((b.duration || 0) - dur));
+  return arr[0];
+}
+function ytSend(prev, cur, next) {
+  const cut = (t, n) => (t || '').slice(0, n);
+  let msg = 'LYR:' + cut(ytTitleSent, 28) + '|' + cut(prev, 48) + '|' + cut(cur, 60) + '|' + cut(next, 48);
+  while (enc.encode(msg).length > 220) msg = msg.slice(0, -1);
+  safeCtrl(msg);
+}
+function ytTick() {
+  if (!ytPlayer || !ytLines.length || !ytPlayer.getCurrentTime) return;
+  const st = ytPlayer.getPlayerState();
+  if (st !== 1) return;                                       // only while playing
+  const t = ytPlayer.getCurrentTime() + (parseFloat($('ytOff').value) || 0);
+  let idx = -1;
+  for (let i = 0; i < ytLines.length; i++) { if (ytLines[i][0] <= t) idx = i; else break; }
+  const now = performance.now();
+  if (idx !== ytIdx || now - ytLastSent > 8000) {
+    ytIdx = idx; ytLastSent = now;
+    ytSend(idx > 0 ? ytLines[idx - 1][1] : '', idx >= 0 ? ytLines[idx][1] : '...', ytLines[idx + 1] ? ytLines[idx + 1][1] : '');
+  }
+}
+$('ytUrl').onchange = async () => {
+  const id = ytVideoId($('ytUrl').value);
+  if (!id) return;
+  try {
+    const r = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + id));
+    const j = await r.json();
+    let name = (j.title || '').replace(/[\(\[].*?[\)\]]/g, '').replace(/official|video|lyrics?|audio|hd|4k/ig, '').trim();
+    let artist = (j.author_name || '').replace(/ - Topic$|VEVO$/i, '').trim();
+    const parts = name.split(/\s+[-\u2013]\s+/);
+    if (parts.length >= 2) { artist = parts[0].trim(); name = parts.slice(1).join(' - ').trim(); }
+    $('ytTitle').value = name; $('ytArtist').value = artist;
+  } catch (e) { ytInfo('Could not read the title. Type the song title and artist.'); }
+};
+$('ytLoad').onclick = async () => {
+  const id = ytVideoId($('ytUrl').value);
+  if (!id) { ytInfo('Paste a valid YouTube link first.'); return; }
+  try {
+    ytInfo('Loading the player...');
+    await ytLoadApi();
+    if (ytPlayer) { ytPlayer.destroy(); ytPlayer = null; $('ytBox').innerHTML = '<div id="ytPlayer"></div>'; }
+    ytPlayer = new YT.Player('ytPlayer', {
+      videoId: id, width: '100%', height: '200',
+      playerVars: { playsinline: 1 },
+      events: {
+        onReady: async () => {
+          const dur = ytPlayer.getDuration();
+          const title = $('ytTitle').value.trim(), artist = $('ytArtist').value.trim();
+          ytInfo('Looking for synced lyrics...');
+          const hit = await ytFindLyrics(title, artist, dur);
+          if (!hit) { ytInfo('No synced lyrics found. Check the title and artist, then press Load again.'); ytLines = []; return; }
+          ytLines = ytParseLrc(hit.syncedLyrics);
+          ytTitleSent = ytCleanText(title || hit.trackName || 'Song');
+          ytIdx = -9;
+          ytInfo('Found: ' + hit.trackName + ' - ' + hit.artistName + ' (' + ytLines.length + ' lines). Press play in the player.');
+        },
+        onStateChange: e => {
+          if (e.data === 0) safeCtrl('LYR:END');               // ended
+          if (e.data === 1) { ytIdx = -9; }                    // playing again: resend the current line
+        }
+      }
+    });
+    if (ytTimer) clearInterval(ytTimer);
+    ytTimer = setInterval(ytTick, 250);
+  } catch (e) { ytInfo('Error: ' + e.message); }
+};
 
 // ---------- Camera mode: blink mirror + "angry when you use the phone" ----------
 let camOn = false, camStream = null, landmarker = null, lastBlinkSent = 0, lastAngrySent = 0, eyesClosed = false, wakeLock = null;
