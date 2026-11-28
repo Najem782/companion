@@ -146,6 +146,12 @@
       <button id="face" class="alt" disabled>Show face</button>
       <button id="play" class="alt" disabled>Play GIF</button>
     </div>
+    <div class="small" style="margin-top:14px">While music plays, show</div>
+    <select id="viewSel">
+      <option value="2">Lyrics</option>
+      <option value="1">Singing face with mic</option>
+    </select>
+    <div class="small">You can also hold your finger on the watch screen for a moment to switch.</div>
     <div class="small" style="margin-top:14px">Test notification</div>
     <input id="ntitle" type="text" placeholder="Title" maxlength="30">
     <input id="ntext" type="text" placeholder="Text" maxlength="120">
@@ -390,6 +396,7 @@ async function syncTime() {
   const epoch = Math.floor(Date.now() / 1000);
   const offsetMin = -new Date().getTimezoneOffset();   // minutes east of UTC
   await writeCtrl('TIME:' + epoch + ':' + offsetMin);
+  try { await writeCtrl('VIEW:' + $('viewSel').value); } catch (e) {}
   log('Connected. Time synced to ' + new Date().toLocaleTimeString());
 }
 function waitStatus(ms = 15000) {
@@ -440,6 +447,7 @@ $('send').onclick = async () => {
 };
 
 $('sync').onclick = () => syncTime().catch(e => log(e.message));
+$('viewSel').onchange = () => writeCtrl('VIEW:' + $('viewSel').value).catch(e => log(e.message));
 $('face').onclick = () => writeCtrl('FACE').catch(e => log(e.message));
 $('play').onclick = () => writeCtrl('GIF').catch(e => log(e.message));
 
